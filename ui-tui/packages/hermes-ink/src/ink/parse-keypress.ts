@@ -75,6 +75,21 @@ const SGR_MOUSE_FRAGMENT_RE = /(?<!\d)(?:\[<|<)?(?:[0-9]|[1-9][0-9]|1\d{2}|2[0-4
 // plus coordinate digits and `;` separators between params.
 const MOUSE_BURST_NOISE_RE = /^(?=[^]*\d)(?=[^]*;)[;\d<\[Mm]*[Mm][;\d<\[Mm]*[Mm][;\d<\[Mm]*[Mm][;\d<\[Mm]*$/
 
+// Charcode test for the same alphabet — avoids allocating a fresh RegExp on
+// every iteration of the burst-edge extension loops in parseTextWithSgrMouseFragments.
+function isMouseLeakChar(c: string): boolean {
+  const code = c.charCodeAt(0)
+
+  return (
+    code === 0x3b /* ; */ ||
+    code === 0x3c /* < */ ||
+    code === 0x5b /* [ */ ||
+    code === 0x4d /* M */ ||
+    code === 0x6d /* m */ ||
+    (code >= 0x30 && code <= 0x39) /* 0-9 */
+  )
+}
+
 function createPasteKey(content: string): ParsedKey {
   return {
     kind: 'key',
@@ -694,11 +709,11 @@ function parseTextWithSgrMouseFragments(text: string): ParsedInput[] | null {
     // events, so they don't match SGR_MOUSE_FRAGMENT_RE but they're still
     // noise we want to swallow rather than type into the prompt.
     let burstStart = first.index!
-    while (burstStart > cursor && /[;\d<\[Mm]/.test(text[burstStart - 1]!)) {
+    while (burstStart > cursor && isMouseLeakChar(text[burstStart - 1]!)) {
       burstStart--
     }
 
-    while (runEnd < text.length && /[;\d<\[Mm]/.test(text[runEnd]!)) {
+    while (runEnd < text.length && isMouseLeakChar(text[runEnd]!)) {
       runEnd++
     }
 
