@@ -548,9 +548,9 @@ def resolve_billing_route(
         return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
-    if provider_name == "nous" or base_url_host_matches(base_url or "", "nousresearch"):
+    if provider_name == "nous" or base_url_host_matches(base_url or "", "nousresearch.com"):
         return BillingRoute(provider="nous", model=(model.split("/")[-1] if model else model), base_url=base_url or "", billing_mode="official_models_api")
-    if provider_name == "xai":
+    if provider_name == "xai" or base_url_host_matches(base_url or "", "x.ai"):
         return BillingRoute(provider="xai", model=(model.split("/")[-1] if model else model), base_url=base_url or "", billing_mode="official_models_api")
     if provider_name in {"custom", "local"} or (base and "localhost" in base):
         return BillingRoute(provider=provider_name or "custom", model=model, base_url=base_url or "", billing_mode="unknown")

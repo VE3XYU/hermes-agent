@@ -5,6 +5,7 @@ from agent.usage_pricing import (
     estimate_usage_cost,
     get_pricing_entry,
     normalize_usage,
+    resolve_billing_route,
 )
 
 
@@ -224,3 +225,61 @@ def test_deepseek_v4_pro_estimate_usage_cost():
     assert result.amount_usd is not None
     # 1M input × $1.74/M + 500K output × $3.48/M = $1.74 + $1.74 = $3.48
     assert float(result.amount_usd) == 3.48
+
+
+def test_resolve_billing_route_routes_nous_to_official_models_api():
+    """nous provider should route to its /models endpoint (#15268).
+
+    Pre-fix the route fell through to ``provider="unknown"`` and the
+    dashboard / CLI usage summary / session ledger showed \\$0.00 for
+    real Nous token consumption.  Post-fix the route lands on
+    ``billing_mode="official_models_api"`` and downstream pricing
+    resolution hits ``https://inference-api.nousresearch.com/v1/models``
+    which returns real per-token pricing in the standard
+    ``{prompt, completion, ...}`` shape.
+    """
+    route = resolve_billing_route(
+        "qwen3.6-plus",
+        provider="nous",
+        base_url="https://inference-api.nousresearch.com/v1",
+    )
+    assert route.provider == "nous"
+    assert route.model == "qwen3.6-plus"
+    assert route.billing_mode == "official_models_api"
+
+
+def test_resolve_billing_route_routes_xai_to_official_models_api():
+    """xai provider symmetric with nous — routes to /models for pricing."""
+    route = resolve_billing_route(
+        "grok-4-fast-reasoning",
+        provider="xai",
+        base_url="https://api.x.ai/v1",
+    )
+    assert route.provider == "xai"
+    assert route.model == "grok-4-fast-reasoning"
+    assert route.billing_mode == "official_models_api"
+
+
+def test_resolve_billing_route_infers_nous_from_base_url_host():
+    """Even without an explicit provider, a nousresearch.com base URL
+    should land on the nous route — guards against custom_providers
+    entries that point at Nous but forget the provider name."""
+    route = resolve_billing_route(
+        "qwen3.6-plus",
+        provider="",
+        base_url="https://inference-api.nousresearch.com/v1",
+    )
+    assert route.provider == "nous"
+    assert route.billing_mode == "official_models_api"
+
+
+def test_resolve_billing_route_infers_xai_from_base_url_host():
+    """Symmetric with nous — a x.ai base URL routes to the xai branch
+    even when the caller omits the provider name."""
+    route = resolve_billing_route(
+        "grok-4-fast-reasoning",
+        provider="",
+        base_url="https://api.x.ai/v1",
+    )
+    assert route.provider == "xai"
+    assert route.billing_mode == "official_models_api"
