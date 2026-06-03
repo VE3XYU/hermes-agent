@@ -320,4 +320,11 @@ export interface HermesSelectPathsOptions {
 export interface BackendExit {
   code: number | null
   signal: string | null
+  // The mode the desktop was operating against when the local helper process
+  // exited. When 'remote', the local process is not the desktop's backend, so
+  // its exit is not a fatal failure.
+  mode?: 'local' | 'remote' | null
+  // True when the exit was triggered by a deliberate teardown (e.g. switching
+  // gateways) rather than a crash.
+  deliberate?: boolean
 }

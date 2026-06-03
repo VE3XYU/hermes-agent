@@ -469,6 +469,11 @@ let bootstrapAbortController = null
 // existing-install adopt branch (3b) so repair re-drives the installer instead
 // of re-adopting the install we're repairing. Cleared once a bootstrap runs.
 let forceBootstrapRepair = false
+// The mode the desktop is currently operating against ('local' | 'remote'),
+// set whenever startHermes() resolves a backend. When 'remote', the local
+// helper process (if one ever spawned and is now being torn down) is NOT the
+// desktop's backend, so its exit must not be reported as a fatal backend exit.
+let activeConnectionMode = null
 let connectionConfigCache = null
 const hermesLog = []
 const previewWatchers = new Map()
@@ -3245,6 +3250,11 @@ function resetHermesConnection() {
   connectionPromise = null
 
   if (hermesProcess && !hermesProcess.killed) {
+    // Mark this teardown as deliberate so the process 'exit' handler does not
+    // broadcast a fatal backend-exit (which would latch a desktop boot failure
+    // even though we're intentionally tearing the local helper down — e.g. to
+    // switch the desktop over to a remote gateway).
+    hermesProcess.__deliberateTeardown = true
     hermesProcess.kill('SIGTERM')
   }
 
@@ -3270,6 +3280,7 @@ async function startHermes() {
     if (remote) {
       await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
       await waitForHermes(remote.baseUrl, remote.token)
+      activeConnectionMode = 'remote'
       updateBootProgress({
         phase: 'backend.ready',
         message: 'Remote Hermes backend is ready',
@@ -3299,6 +3310,7 @@ async function startHermes() {
 
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
+    activeConnectionMode = 'local'
 
     hermesProcess = spawn(backend.command, backend.args, {
       cwd: hermesCwd,
@@ -3324,6 +3336,10 @@ async function startHermes() {
 
     hermesProcess.stdout.on('data', rememberLog)
     hermesProcess.stderr.on('data', rememberLog)
+    // Capture a stable reference for the exit/error closures: resetHermesConnection
+    // nulls out the module-level hermesProcess before the 'exit' event fires, so
+    // the handler needs its own handle to read the deliberate-teardown flag.
+    const spawnedProcess = hermesProcess
     let backendReady = false
     let rejectBackendStart = null
     const backendStartFailed = new Promise((_resolve, reject) => {
@@ -3342,15 +3358,20 @@ async function startHermes() {
       )
       hermesProcess = null
       connectionPromise = null
-      sendBackendExit({ code: null, signal: null, error: error.message })
+      sendBackendExit({ code: null, signal: null, error: error.message, mode: activeConnectionMode })
       rejectBackendStart?.(error)
     })
     hermesProcess.once('exit', (code, signal) => {
       rememberLog(`Hermes backend exited (${signal || code})`)
+      const deliberate = Boolean(spawnedProcess?.__deliberateTeardown)
       hermesProcess = null
       connectionPromise = null
-      sendBackendExit({ code, signal })
-      if (!backendReady) {
+      // Tag the exit so the renderer can decide whether it's fatal. A deliberate
+      // teardown (resetHermesConnection — e.g. switching to a remote gateway)
+      // must not latch a desktop boot failure: the local helper is being torn
+      // down on purpose, not crashing.
+      sendBackendExit({ code, signal, mode: activeConnectionMode, deliberate })
+      if (!backendReady && !deliberate) {
         const message = `Hermes backend exited before it became ready (${signal || code}).`
         updateBootProgress(
           {

@@ -14,6 +14,8 @@ import { notify, notifyError } from '@/store/notifications'
 import { $connection, setConnection, setGatewayState, setSessionsLoading } from '@/store/session'
 import type { RpcEvent } from '@/types/hermes'
 
+import { isFatalBackendExit } from '@/lib/backend-exit'
+
 interface GatewayBootOptions {
   handleGatewayEvent: (event: RpcEvent) => void
   onConnectionReady: (
@@ -90,7 +92,18 @@ export function useGatewayBoot({
       }
     })
 
-    const offExit = desktop.onBackendExit(() => {
+    const offExit = desktop.onBackendExit(payload => {
+      // A local helper process exiting is only fatal when the desktop is
+      // actually attached to that local backend. In remote mode (or when the
+      // exit was a deliberate teardown, e.g. switching to a remote gateway),
+      // the local process is not our backend — ignore it so a remote-ready
+      // boot doesn't stay latched behind a stale local-exit failure (#37869).
+      const fatal = isFatalBackendExit(payload, $connection.get()?.mode)
+
+      if (!fatal) {
+        return
+      }
+
       if ($desktopBoot.get().running || $desktopBoot.get().visible) {
         failDesktopBoot('Hermes background process exited during startup.')
       }
