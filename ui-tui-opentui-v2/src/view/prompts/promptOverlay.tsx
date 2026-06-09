@@ -12,7 +12,7 @@
 import { Match, Switch } from 'solid-js'
 
 import { deferClose } from '../../logic/defer.ts'
-import type { SessionStore } from '../../logic/store.ts'
+import type { ActivePrompt, SessionStore } from '../../logic/store.ts'
 import { ApprovalPrompt } from './approvalPrompt.tsx'
 import { ClarifyPrompt } from './clarifyPrompt.tsx'
 import { ConfirmPrompt } from './confirmPrompt.tsx'
@@ -35,26 +35,20 @@ export function PromptOverlay(props: PromptOverlayProps) {
     clearSoon()
   }
 
-  const asApproval = () => {
-    const p = prompt()
-    return p && p.kind === 'approval' ? p : undefined
+  // Reactive accessor that narrows the active-prompt union to one `kind`, giving
+  // each <Match> branch its precise typed payload (undefined when not that kind).
+  function narrow<K extends ActivePrompt['kind']>(kind: K): () => Extract<ActivePrompt, { kind: K }> | undefined {
+    const matches = (p: ActivePrompt): p is Extract<ActivePrompt, { kind: K }> => p.kind === kind
+    return () => {
+      const p = prompt()
+      return p && matches(p) ? p : undefined
+    }
   }
-  const asClarify = () => {
-    const p = prompt()
-    return p && p.kind === 'clarify' ? p : undefined
-  }
-  const asSudo = () => {
-    const p = prompt()
-    return p && p.kind === 'sudo' ? p : undefined
-  }
-  const asSecret = () => {
-    const p = prompt()
-    return p && p.kind === 'secret' ? p : undefined
-  }
-  const asConfirm = () => {
-    const p = prompt()
-    return p && p.kind === 'confirm' ? p : undefined
-  }
+  const asApproval = narrow('approval')
+  const asClarify = narrow('clarify')
+  const asSudo = narrow('sudo')
+  const asSecret = narrow('secret')
+  const asConfirm = narrow('confirm')
 
   return (
     <Switch>
