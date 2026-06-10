@@ -261,9 +261,11 @@ export function drive(
  * path produces (minus the rolling cap), so `commitSnapshot` mounts the real shape.
  */
 export function materialize(total: number): Message[] {
-  const prev = process.env.HERMES_TUI_MAX_MESSAGES
-  process.env.HERMES_TUI_MAX_MESSAGES = String(Number.MAX_SAFE_INTEGER)
-  const store = createSessionStore()
+  // `uncappedFixture` bypasses the store's handle-safe cap CLAMP (an env value
+  // can no longer raise the cap past logic/store.ts HANDLE_SAFE_MAX_ROWS — the
+  // old env=MAX_SAFE_INTEGER trick would now silently truncate to 1000 rows).
+  // This store is never mounted into a renderer, so no native handles are at stake.
+  const store = createSessionStore({ uncappedFixture: true })
   store.apply({ type: 'gateway.ready' })
   let pushed = 0
   let turn = 0
@@ -272,9 +274,6 @@ export function materialize(total: number): Message[] {
     pushed += rowsPerTurn(turn)
     turn++
   }
-  // Restore the env so the bench's own cap (read per-store) is unaffected.
-  if (prev === undefined) delete process.env.HERMES_TUI_MAX_MESSAGES
-  else process.env.HERMES_TUI_MAX_MESSAGES = prev
   // Deep-copy out of the solid store proxy into plain objects (the resume path
   // takes a plain Message[]).
   return store.state.messages.slice(0, total).map(cloneMessage)

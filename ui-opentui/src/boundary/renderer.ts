@@ -15,10 +15,15 @@ import { Deferred, Effect } from 'effect'
 import { RendererError } from './errors.ts'
 import { installFfiCoordSafety } from './ffiSafe.ts'
 import { getLog } from './log.ts'
+import { installSyntaxStyleDegrade } from './nativeHandles.ts'
 
 // Node-FFI seam: clamp negative draw coordinates BEFORE the u32 FFI marshaling
 // (see ffiSafe.ts — scrolled-out <diff> line backgrounds crashed the render loop).
 installFfiCoordSafety()
+// Native handle-table seam: SyntaxStyle allocation failure (global 65,534-slot
+// registry exhausted) degrades to an unstyled detached style instead of throwing
+// out of a Solid mount effect (see nativeHandles.ts for the full root cause).
+installSyntaxStyleDegrade()
 
 /**
  * The text a finished selection copies: the RENDERED text the user highlighted,
@@ -64,8 +69,11 @@ export interface RendererOptions {
 export const acquireRenderer = Effect.fn('Renderer.acquire')(function* (options: RendererOptions) {
   const renderer = yield* Effect.acquireRelease(
     Effect.tryPromise({
-      try: () =>
-        createCliRenderer({
+      try: async () => {
+        // Snapshot process error listeners so we can guard exactly the ones the
+        // renderer installs (its `handleError` — see guardRendererErrorHandlers).
+        const preexisting = snapshotErrorListeners()
+        const created = await createCliRenderer({
           // Root canvas: TRANSPARENT by default — the terminal's own background
           // shows through (do not paint a "default dark" canvas; glitch hated
           // it). A skin's explicit ui_bg lands reactively via the header's
@@ -83,7 +91,10 @@ export const acquireRenderer = Effect.fn('Renderer.acquire')(function* (options:
           exitSignals: ['SIGINT', 'SIGTERM', 'SIGQUIT', 'SIGHUP'],
           useKittyKeyboard: {},
           useMouse: options.mouse
-        }),
+        })
+        guardRendererErrorHandlers(created, preexisting)
+        return created
+      },
       catch: cause => new RendererError({ cause })
     }),
     renderer => Effect.sync(() => destroyRenderer(renderer))
@@ -143,5 +154,68 @@ function destroyRenderer(renderer: CliRenderer): void {
     if (!renderer.isDestroyed) renderer.destroy()
   } catch {
     // teardown is best-effort; a failed destroy must not mask the real exit cause.
+  }
+}
+
+// ── honest-crash guard for the renderer's process error handlers ─────────────
+//
+// CliRenderer installs its own `uncaughtException`/`unhandledRejection` handler
+// (`handleError`: console.error + console.show()). `console.show()` ALLOCATES —
+// the console-overlay OptimizedBuffer needs a native handle — so under native
+// handle-table exhaustion (the very condition being reported, see
+// nativeHandles.ts) the handler itself throws `Failed to create optimized
+// buffer: WxH`, and Node kills the process with exit 7, MASKING the original
+// error (this is exactly the bench mem3000 postmortem). Wrap the listeners the
+// renderer added so a handler failure is logged honestly and the original
+// error stays the story; while the renderer is alive the process keeps running
+// (core's own contract: handled uncaught exceptions don't exit).
+
+type ProcessErrorEvent = 'uncaughtException' | 'unhandledRejection'
+const PROCESS_ERROR_EVENTS: readonly ProcessErrorEvent[] = ['uncaughtException', 'unhandledRejection']
+type ErrorListener = (...args: unknown[]) => void
+
+// Node's typings don't accept the union event name in listeners/on/removeListener
+// overloads — view the process emitter through a minimal untyped seam.
+const proc = process as unknown as {
+  listeners(event: ProcessErrorEvent): ErrorListener[]
+  on(event: ProcessErrorEvent, listener: ErrorListener): void
+  removeListener(event: ProcessErrorEvent, listener: ErrorListener): void
+}
+
+function snapshotErrorListeners(): ReadonlyMap<ProcessErrorEvent, ReadonlySet<unknown>> {
+  return new Map(PROCESS_ERROR_EVENTS.map(event => [event, new Set(proc.listeners(event))]))
+}
+
+/** Re-wrap the error listeners `createCliRenderer` added (delta vs the snapshot)
+ *  so an exception INSIDE them can never exit-7-mask the original error. */
+function guardRendererErrorHandlers(
+  renderer: CliRenderer,
+  preexisting: ReadonlyMap<ProcessErrorEvent, ReadonlySet<unknown>>
+): void {
+  for (const event of PROCESS_ERROR_EVENTS) {
+    const before = preexisting.get(event)
+    for (const listener of proc.listeners(event)) {
+      if (before?.has(listener)) continue
+      proc.removeListener(event, listener)
+      const guarded: ErrorListener = (...args) => {
+        // After teardown the renderer can no longer report anything — rethrow so
+        // the ORIGINAL error reaches Node's default fatal path unmasked.
+        if (renderer.isDestroyed) throw args[0]
+        try {
+          listener(...args)
+        } catch (handlerFailure) {
+          try {
+            const original = args[0]
+            getLog().error('renderer', 'core error handler crashed while reporting an uncaught error', {
+              original: original instanceof Error ? (original.stack ?? original.message) : String(original),
+              handlerFailure: String(handlerFailure)
+            })
+          } catch {
+            // logging is best-effort — never throw out of an exception handler.
+          }
+        }
+      }
+      proc.on(event, guarded)
+    }
   }
 }

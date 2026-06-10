@@ -4,7 +4,9 @@ import unusedImports from "eslint-plugin-unused-imports"
 
 export default tseslint.config(
   {
-    ignores: ["node_modules/**", "dist/**", ".repos/**", "*.frame.txt", "*.ansi"],
+    // .bench/ is a build artifact of the bench suite's `nodes` cell
+    // (bench/run.mjs builds scripts/mem-bench.tsx into it) — never lint it.
+    ignores: ["node_modules/**", "dist/**", ".bench/**", ".repos/**", "*.frame.txt", "*.ansi"],
   },
   js.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,

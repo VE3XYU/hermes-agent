@@ -383,7 +383,14 @@ function subagentStatusFor(type: string): string {
   return 'running'
 }
 
-export function createSessionStore() {
+export interface SessionStoreOptions {
+  /** Fixture/diagnostic harnesses ONLY (scripts/fixture.ts `materialize`): bypass
+   *  the handle-safe cap for a store that is never mounted into a renderer.
+   *  Production stores must stay clamped — see HANDLE_SAFE_MAX_ROWS below. */
+  readonly uncappedFixture?: boolean
+}
+
+export function createSessionStore(options?: SessionStoreOptions) {
   // Rolling cap on retained transcript rows. OpenTUI lays out via Yoga (WASM), whose
   // linear memory is grow-only — every live `<For>` row is a Yoga-node subtree, so an
   // uncapped `messages[]` ratchets the high-water mark up over a long session and never
@@ -391,16 +398,30 @@ export function createSessionStore() {
   // `<For>` UNMOUNT exactly the evicted oldest rows → `Renderable.destroy()` →
   // `yogaNode.free()`, returning those nodes to the WASM allocator's free list.
   //
-  // Default 3000 (≈1500 turns of scrollback): the highest cap whose steady-state RSS
-  // stays within a sane TUI budget on the realistic-fixture bench (~20.4 renderables/
-  // msg, ~0.65 MB/msg → ~2 GB at 3000 — and that ceiling is only reached by marathon
-  // 3000+-message sessions; typical sessions cost a fraction). opencode caps at 100;
-  // we trade memory for far more in-TUI scrollback (the dashboard holds the rest).
-  // Read once per store from `HERMES_TUI_MAX_MESSAGES`. Turns trimmed beyond the cap
-  // aren't lost — they live on the gateway and are recoverable via `/resume`.
+  // The BINDING limit is NOT memory, it's the native handle table: @opentui/core
+  // indexes every native object through ONE global 65,534-slot registry
+  // (zig/handles.zig, 16-bit slot indices), and every text-bearing renderable
+  // burns THREE slots (TextBuffer + TextBufferView + SyntaxStyle —
+  // TextBufferRenderable.ts:77-80). The bench fixture measured ~47 handles/row
+  // (~16 text renderables/row), so the table exhausts at ≈1,400 LIVE rows with
+  // an uncaught "Failed to create SyntaxStyle" mid-mount (crash anatomy +
+  // degrade shim: boundary/nativeHandles.ts). The previous default of 3000 was
+  // therefore unreachable — the TUI crashed before the cap ever bound.
+  //
+  // HANDLE_SAFE_MAX_ROWS = 1000 ≈ 47k handles ≈ 72% of the table on the
+  // realistic-fixture mix, leaving ~18k slots of headroom for chrome
+  // (composer/pickers/dashboard) and heavier-than-fixture rows. Pathological
+  // rows can still exceed it — renderable-weight-aware capping belongs to the
+  // virtualization work (#27); until then nativeHandles.ts degrades (unstyled
+  // text) instead of crashing. `HERMES_TUI_MAX_MESSAGES` can LOWER the cap but
+  // never raise it past the ceiling. Read once per store. Trimmed turns aren't
+  // lost — they live on the gateway and are recoverable via `/resume`.
+  const HANDLE_SAFE_MAX_ROWS = 1000
   const MESSAGE_CAP = (() => {
+    if (options?.uncappedFixture) return Number.MAX_SAFE_INTEGER
     const raw = Number.parseInt(process.env.HERMES_TUI_MAX_MESSAGES ?? '', 10)
-    return Number.isFinite(raw) && raw > 0 ? raw : 3000
+    const requested = Number.isFinite(raw) && raw > 0 ? raw : HANDLE_SAFE_MAX_ROWS
+    return Math.min(requested, HANDLE_SAFE_MAX_ROWS)
   })()
 
   const [state, setState] = createStore<StoreState>({

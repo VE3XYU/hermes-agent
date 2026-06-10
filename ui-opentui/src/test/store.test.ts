@@ -578,12 +578,33 @@ describe('session store — rolling message cap (bounds the Yoga node high-water
     expect(store.state.messages.at(-1)!.text).toBe('h7')
   })
 
-  test('defaults to 3000 when the env var is unset/invalid', () => {
+  test('defaults to 1000 (the handle-safe ceiling) when the env var is unset/invalid', () => {
     delete process.env[ENV_KEY]
     const store = createSessionStore()
-    for (let i = 0; i < 3050; i++) store.pushUser(`m${i}`)
-    expect(store.state.messages).toHaveLength(3000)
+    for (let i = 0; i < 1050; i++) store.pushUser(`m${i}`)
+    expect(store.state.messages).toHaveLength(1000)
     expect(store.state.messages[0]!.text).toBe('m50') // oldest 50 dropped
+  })
+
+  test('env values ABOVE the handle-safe ceiling are clamped to it (the native handle table binds, not memory)', () => {
+    // @opentui/core's global handle registry holds 65,534 live objects and a
+    // text renderable costs 3; ~47 handles/row on the realistic fixture means
+    // ≳1,400 live rows crashes mid-mount ("Failed to create SyntaxStyle").
+    // A 100000 "cap" is therefore a crash sentence, not a cap — clamp it.
+    process.env[ENV_KEY] = '100000'
+    const store = createSessionStore()
+    for (let i = 0; i < 1100; i++) store.pushUser(`m${i}`)
+    expect(store.state.messages).toHaveLength(1000)
+    expect(store.state.dropped).toBe(100)
+    expect(store.state.messages[0]!.text).toBe('m100')
+  })
+
+  test('uncappedFixture bypasses the clamp (fixture materialization — store never mounted)', () => {
+    delete process.env[ENV_KEY]
+    const store = createSessionStore({ uncappedFixture: true })
+    for (let i = 0; i < 1100; i++) store.pushUser(`m${i}`)
+    expect(store.state.messages).toHaveLength(1100)
+    expect(store.state.dropped).toBe(0)
   })
 
   test('clearTranscript empties messages AND the applied dedup set', () => {
