@@ -7,6 +7,7 @@ import time
 import types
 from datetime import datetime
 from pathlib import Path
+import pytest
 from unittest.mock import patch
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -7497,3 +7498,178 @@ def test_reap_idle_sessions_closes_only_evictable(monkeypatch):
         assert closed == [("stale", "idle_timeout")]
     finally:
         server._sessions.clear()
+
+
+# ── /usage: compact in-process page with real-only costs ─────────────────────
+
+
+def _usage_agent(**overrides):
+    """SimpleNamespace agent with realistic session counters for /usage."""
+    base = dict(
+        model="anthropic/claude-sonnet-4.6",
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        session_input_tokens=35_000,
+        session_output_tokens=10_000,
+        session_cache_read_tokens=5_000,
+        session_cache_write_tokens=2_000,
+        session_reasoning_tokens=0,
+        session_prompt_tokens=40_000,
+        session_completion_tokens=10_000,
+        session_total_tokens=50_000,
+        session_api_calls=5,
+        session_actual_cost_usd=None,
+        session_model_usage={},
+        context_compressor=None,
+    )
+    base.update(overrides)
+    return types.SimpleNamespace(**base)
+
+
+def _mute_usage_externals(monkeypatch):
+    import agent.account_usage as account_usage
+
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(account_usage, "nous_credits_compact_line", lambda **kw: None)
+
+
+def test_get_usage_cost_absent_when_provider_reports_nothing(monkeypatch):
+    """No estimation: even a model with known pricing gets NO cost_usd field."""
+    agent = _usage_agent()
+    usage = server._get_usage(agent)
+    assert "cost_usd" not in usage
+    assert usage["input"] == 35_000
+
+
+def test_get_usage_cost_present_when_provider_reported(monkeypatch):
+    agent = _usage_agent(session_actual_cost_usd=0.4321)
+    usage = server._get_usage(agent)
+    assert usage["cost_usd"] == pytest.approx(0.4321)
+    assert usage["cost_status"] == "actual"
+
+
+def test_get_usage_cost_from_nous_credits_delta(monkeypatch):
+    agent = _usage_agent(provider="nous")
+    agent.get_credits_spent_micros = lambda: 250_000  # $0.25 real header delta
+    usage = server._get_usage(agent)
+    assert usage["cost_usd"] == pytest.approx(0.25)
+
+
+def test_compact_usage_per_model_rows_and_real_cost(monkeypatch):
+    _mute_usage_externals(monkeypatch)
+    agent = _usage_agent(
+        session_actual_cost_usd=0.42,
+        session_model_usage={
+            "anthropic/claude-sonnet-4.6": {
+                "calls": 4, "input": 30_000, "output": 9_000,
+                "cache_read": 5_000, "cache_write": 2_000, "cost_usd": 0.42,
+            },
+            "deepseek/deepseek-chat": {
+                "calls": 1, "input": 5_000, "output": 1_000,
+                "cache_read": 0, "cache_write": 0, "cost_usd": None,
+            },
+        },
+    )
+    text = server._compact_usage_text(_session(agent=agent))
+
+    assert "Session — anthropic/claude-sonnet-4.6 (openrouter)" in text
+    sonnet_row = next(l for l in text.splitlines() if "claude-sonnet-4.6" in l and "reqs" in l)
+    assert "reqs 4" in sonnet_row and "$0.4200" in sonnet_row
+    deepseek_row = next(l for l in text.splitlines() if "deepseek-chat" in l)
+    # Cost not reported for this model → no dollar figure on its row.
+    assert "reqs 1" in deepseek_row and "$" not in deepseek_row
+    assert "session cost: $0.4200 (provider-reported)" in text
+    assert "/usage full" in text
+
+
+def test_compact_usage_absent_cost_never_renders_zero(monkeypatch):
+    _mute_usage_externals(monkeypatch)
+    agent = _usage_agent()  # nothing reported
+    text = server._compact_usage_text(_session(agent=agent))
+    assert "session cost: not reported by provider" in text
+    assert "$0.00" not in text
+
+
+def test_compact_usage_no_agent(monkeypatch):
+    _mute_usage_externals(monkeypatch)
+    text = server._compact_usage_text(_session(agent=None) | {"agent": None})
+    assert "no API calls yet" in text
+
+
+def test_compact_usage_recent_summary_and_credits_line(monkeypatch):
+    import agent.account_usage as account_usage
+
+    class _DB:
+        def usage_totals(self, days=30):
+            return {
+                "days": 30, "sessions": 12, "input_tokens": 1_200_000,
+                "output_tokens": 90_000, "api_calls": 64,
+                "reported_cost_usd": 4.5678,
+            }
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(
+        account_usage, "nous_credits_compact_line",
+        lambda **kw: "Nous credits (Ultra): Total usable: $988.99 · Renews: 2026-06-11",
+    )
+    text = server._compact_usage_text(_session(agent=_usage_agent()))
+    assert "Last 30d: 12 sessions" in text
+    assert "reported cost $4.57" in text
+    assert "Nous credits (Ultra)" in text
+
+
+def test_compact_usage_recent_summary_hides_unreported_cost(monkeypatch):
+    _mute_usage_externals(monkeypatch)
+
+    class _DB:
+        def usage_totals(self, days=30):
+            return {
+                "days": 30, "sessions": 3, "input_tokens": 10_000,
+                "output_tokens": 2_000, "api_calls": 7,
+                "reported_cost_usd": None,
+            }
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    text = server._compact_usage_text(_session(agent=_usage_agent()))
+    assert "Last 30d: 3 sessions" in text
+    assert "reported cost" not in text
+
+
+def test_slash_exec_usage_is_answered_in_process(monkeypatch):
+    """/usage must not hit the slash worker (it has no live agent)."""
+    _mute_usage_externals(monkeypatch)
+    server._sessions["sid-usage"] = _session(agent=_usage_agent())
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "slash.exec",
+             "params": {"session_id": "sid-usage", "command": "usage"}}
+        )
+        out = resp["result"]["output"]
+        assert "Session — anthropic/claude-sonnet-4.6" in out
+        # Worker untouched.
+        assert server._sessions["sid-usage"]["slash_worker"] is None
+    finally:
+        server._sessions.pop("sid-usage", None)
+
+
+def test_slash_exec_usage_full_falls_through_to_worker(monkeypatch):
+    ran = []
+
+    class _Worker:
+        def run(self, cmd):
+            ran.append(cmd)
+            return "detailed legacy page"
+
+    sess = _session(agent=_usage_agent())
+    sess["slash_worker"] = _Worker()
+    server._sessions["sid-usage-full"] = sess
+    try:
+        monkeypatch.setattr(server, "_mirror_slash_side_effects", lambda *a: "")
+        resp = server.handle_request(
+            {"id": "1", "method": "slash.exec",
+             "params": {"session_id": "sid-usage-full", "command": "usage full"}}
+        )
+        assert resp["result"]["output"] == "detailed legacy page"
+        assert ran == ["usage full"]
+    finally:
+        server._sessions.pop("sid-usage-full", None)

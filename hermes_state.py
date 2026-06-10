@@ -1695,6 +1695,36 @@ class SessionDB:
 
         return self._execute_write(_do) or 0
 
+    def usage_totals(self, days: int = 30) -> Dict[str, Any]:
+        """Aggregate usage for sessions started in the last ``days``.
+
+        ``reported_cost_usd`` sums only provider-REPORTED ``actual_cost_usd``
+        (never estimates) and is None when no session in the window has a
+        reported cost — callers must hide cost rather than print $0.00.
+        """
+        cutoff = time.time() - days * 86400
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT COUNT(*) AS sessions,
+                          COALESCE(SUM(input_tokens), 0)
+                            + COALESCE(SUM(cache_read_tokens), 0)
+                            + COALESCE(SUM(cache_write_tokens), 0) AS input_tokens,
+                          COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                          COALESCE(SUM(api_call_count), 0) AS api_calls,
+                          SUM(actual_cost_usd) AS reported_cost_usd
+                   FROM sessions WHERE started_at >= ?""",
+                (cutoff,),
+            ).fetchone()
+        result = dict(row) if row else {}
+        return {
+            "days": days,
+            "sessions": int(result.get("sessions") or 0),
+            "input_tokens": int(result.get("input_tokens") or 0),
+            "output_tokens": int(result.get("output_tokens") or 0),
+            "api_calls": int(result.get("api_calls") or 0),
+            "reported_cost_usd": result.get("reported_cost_usd"),
+        }
+
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
         with self._lock:

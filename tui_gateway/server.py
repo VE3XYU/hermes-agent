@@ -2306,6 +2306,102 @@ def _get_usage(agent) -> dict:
     return usage
 
 
+def _compact_usage_text(session: dict) -> str:
+    """Compact /usage page: current session per-model rows + a tight recent
+    summary + a one-line Nous credits gauge.
+
+    Costs are provider-REPORTED only. When a provider reports nothing the
+    cost is simply omitted (never rendered as $0.00). The detailed legacy
+    page stays reachable via `/usage full` (slash-worker → CLI path).
+    """
+    from agent.usage_pricing import format_token_count_compact as _fmt
+
+    agent = session.get("agent")
+    lines: list[str] = []
+
+    calls = (getattr(agent, "session_api_calls", 0) or 0) if agent is not None else 0
+    if agent is not None and calls > 0:
+        u = _get_usage(agent)
+        header = f"Session — {u['model']}"
+        provider = getattr(agent, "provider", None)
+        if provider:
+            header += f" ({provider})"
+        lines.append(header)
+
+        per_model = getattr(agent, "session_model_usage", None) or {}
+        rows = list(per_model.items()) or [(
+            u["model"],
+            {
+                "calls": u["calls"], "input": u["input"], "output": u["output"],
+                "cache_read": u["cache_read"], "cache_write": u["cache_write"],
+                "cost_usd": None,
+            },
+        )]
+        name_w = max(len(name or "?") for name, _ in rows)
+        for name, row in rows:
+            cells = [
+                f"{(name or '?'):<{name_w}}",
+                f"reqs {row.get('calls', 0)}",
+                f"in {_fmt(int(row.get('input', 0) or 0))}",
+                f"out {_fmt(int(row.get('output', 0) or 0))}",
+            ]
+            cache_read = int(row.get("cache_read", 0) or 0)
+            if cache_read:
+                cells.append(f"cache {_fmt(cache_read)}")
+            cost = row.get("cost_usd")
+            if cost is not None:
+                cells.append(f"${cost:.4f}")
+            lines.append("  " + " · ".join(cells))
+
+        ctx_pct = u.get("context_percent")
+        tail = [f"total {_fmt(int(u['total'] or 0))} tokens", f"{u['calls']} calls"]
+        if ctx_pct is not None:
+            tail.append(f"context {ctx_pct}%")
+        if u.get("compressions"):
+            tail.append(f"compressions {u['compressions']}")
+        lines.append("  " + " · ".join(tail))
+
+        cost_usd = u.get("cost_usd")
+        if cost_usd is not None:
+            lines.append(f"  session cost: ${cost_usd:.4f} (provider-reported)")
+        else:
+            lines.append("  session cost: not reported by provider")
+    else:
+        lines.append("Session — no API calls yet")
+
+    # Tight recent summary from the session DB (real costs only).
+    try:
+        db = _get_db()
+        totals = db.usage_totals(days=30) if db is not None else None
+    except Exception:
+        totals = None
+    if totals and totals.get("sessions"):
+        from agent.usage_pricing import format_token_count_compact as _fmt30
+
+        parts = [
+            f"{totals['sessions']} sessions",
+            f"in {_fmt30(totals['input_tokens'])}",
+            f"out {_fmt30(totals['output_tokens'])}",
+        ]
+        reported = totals.get("reported_cost_usd")
+        if reported is not None:
+            parts.append(f"reported cost ${float(reported):.2f}")
+        lines.append("Last 30d: " + " · ".join(parts))
+
+    # Nous credits one-liner (account-level; independent of the live agent).
+    try:
+        from agent.account_usage import nous_credits_compact_line
+
+        credits_line = nous_credits_compact_line()
+    except Exception:
+        credits_line = None
+    if credits_line:
+        lines.append(credits_line)
+
+    lines.append("(/usage full — detailed page)")
+    return "\n".join(lines)
+
+
 def _probe_credentials(agent) -> str:
     """Light credential check at session creation — returns warning or ''."""
     try:
@@ -9182,6 +9278,17 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, {"output": str(result or "(no output)")})
         except Exception as e:
             return _ok(rid, {"output": f"Plugin command error: {e}"})
+
+    # /usage — answered in-process from the LIVE agent's session counters.
+    # The slash worker is a separate subprocess that resumes the session
+    # WITHOUT an agent, so it can never see current-session tokens/costs
+    # (it only printed the Nous credits block). `/usage full` still falls
+    # through to the worker for the detailed CLI page.
+    if _cmd_base == "usage" and _cmd_arg.strip().lower() not in {"full", "--full"}:
+        try:
+            return _ok(rid, {"output": _compact_usage_text(session)})
+        except Exception:
+            pass  # fall through to the slash worker
 
     worker = session.get("slash_worker")
     if not worker:

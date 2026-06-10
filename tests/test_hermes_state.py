@@ -158,6 +158,37 @@ class TestSessionLifecycle:
         assert session["api_call_count"] == 5
         assert session["input_tokens"] == 300
 
+    def test_update_token_counts_actual_cost_null_keeps_value(self, db):
+        """A NULL actual_cost_usd delta must not touch the stored REAL cost."""
+        db.create_session(session_id="s1", source="cli")
+        db.update_token_counts("s1", input_tokens=100, actual_cost_usd=0.25)
+        db.update_token_counts("s1", input_tokens=100, actual_cost_usd=None)
+        db.update_token_counts("s1", input_tokens=100, actual_cost_usd=0.10)
+
+        session = db.get_session("s1")
+        assert session["actual_cost_usd"] == pytest.approx(0.35)
+
+    def test_usage_totals_reported_cost_none_when_nothing_reported(self, db):
+        """usage_totals must distinguish 'no reported cost' (None) from $0."""
+        db.create_session(session_id="s1", source="cli")
+        db.update_token_counts("s1", input_tokens=100, output_tokens=50, api_call_count=1)
+
+        totals = db.usage_totals(days=30)
+        assert totals["sessions"] == 1
+        assert totals["input_tokens"] == 100
+        assert totals["output_tokens"] == 50
+        assert totals["reported_cost_usd"] is None
+
+    def test_usage_totals_sums_reported_costs(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="tui")
+        db.update_token_counts("s1", input_tokens=100, actual_cost_usd=0.20)
+        db.update_token_counts("s2", input_tokens=300, actual_cost_usd=0.05)
+
+        totals = db.usage_totals(days=30)
+        assert totals["sessions"] == 2
+        assert totals["reported_cost_usd"] == pytest.approx(0.25)
+
     def test_update_token_counts_backfills_model_when_null(self, db):
         db.create_session(session_id="s1", source="telegram")
         db.update_token_counts("s1", input_tokens=10, output_tokens=5, model="openai/gpt-5.4")

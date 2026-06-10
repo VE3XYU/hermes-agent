@@ -243,6 +243,17 @@ def nous_credits_lines(*, markdown: bool = False, timeout: float = 10.0) -> list
     renders from that fixture instead of the real portal (so the block + gauge are
     testable without a live account). Throwaway scaffolding.
     """
+    snapshot = _fetch_nous_credits_snapshot(timeout=timeout)
+    return render_account_usage_lines(snapshot, markdown=markdown)
+
+
+def _fetch_nous_credits_snapshot(timeout: float = 10.0) -> Optional[AccountUsageSnapshot]:
+    """Auth-gate + portal fetch + snapshot build for the Nous credits block.
+
+    Shared by ``nous_credits_lines`` (full block) and
+    ``nous_credits_compact_line`` (one-liner). Honors the
+    HERMES_DEV_CREDITS_FIXTURE dev override. Fail-open → None.
+    """
     # Dev fixture short-circuit — render /usage from the injected state, no portal.
     try:
         from agent.credits_tracker import dev_fixture_credits_state
@@ -251,17 +262,16 @@ def nous_credits_lines(*, markdown: bool = False, timeout: float = 10.0) -> list
     except Exception:
         fixture = None
     if fixture is not None:
-        snapshot = _snapshot_from_credits_state(fixture)
-        return render_account_usage_lines(snapshot, markdown=markdown)
+        return _snapshot_from_credits_state(fixture)
 
     try:
         from hermes_cli.auth import get_provider_auth_state
 
         tok = (get_provider_auth_state("nous") or {}).get("access_token")
         if not (isinstance(tok, str) and tok.strip()):
-            return []
+            return None
     except Exception:
-        return []
+        return None
     try:
         import concurrent.futures
 
@@ -271,13 +281,36 @@ def nous_credits_lines(*, markdown: bool = False, timeout: float = 10.0) -> list
             account = pool.submit(
                 get_nous_portal_account_info, force_fresh=True
             ).result(timeout=timeout)
-        snapshot = build_nous_credits_snapshot(account)
-        return render_account_usage_lines(snapshot, markdown=markdown)
+        return build_nous_credits_snapshot(account)
     except Exception:
         # Fail-open (caller shows nothing), but leave a breadcrumb so a dead
         # /usage credits block is diagnosable in agent.log without a dev flag.
         logger.debug("credits ▸ /usage portal fetch/render failed (fail-open)", exc_info=True)
-        return []
+        return None
+
+
+def nous_credits_compact_line(*, timeout: float = 10.0) -> Optional[str]:
+    """One-line Nous credits summary for the compact /usage view, or None.
+
+    Condenses the snapshot's own detail strings (stable, locally-built
+    formats) into ``Nous credits (Plan): Total usable: $X · Renews: …``.
+    Same gating/fail-open semantics as ``nous_credits_lines``.
+    """
+    snap = _fetch_nous_credits_snapshot(timeout=timeout)
+    if snap is None or not snap.available:
+        return None
+    picked = [
+        d for d in snap.details
+        if d.startswith(("Total usable:", "Renews:", "Status:"))
+    ]
+    if not picked:
+        picked = [d for d in snap.details if not d.startswith("Manage / top up:")][:2]
+    if not picked:
+        return None
+    title = snap.title
+    if snap.plan:
+        title += f" ({snap.plan})"
+    return f"{title}: " + " · ".join(picked)
 
 
 def _snapshot_from_credits_state(state) -> Optional[AccountUsageSnapshot]:

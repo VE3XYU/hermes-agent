@@ -184,3 +184,37 @@ class TestOpenRouterUsageParam:
             is_openrouter=False,
         )
         assert "usage" not in (kwargs.get("extra_body") or {})
+
+
+# ── nous_credits_compact_line — one-liner for the compact /usage page ───────
+
+
+class TestNousCreditsCompactLine:
+    def test_condenses_snapshot_details(self, monkeypatch):
+        import agent.account_usage as au
+
+        snap = au.AccountUsageSnapshot(
+            provider="nous",
+            source="portal-account",
+            fetched_at=au._utc_now(),
+            title="Nous credits",
+            plan="Ultra",
+            details=(
+                "Subscription credits: $-0.79",
+                "Top-up credits: $988.99",
+                "Total usable: $988.99",
+                "Renews: 2026-06-11T08:14:55.000Z",
+                "Manage / top up: https://portal.nousresearch.com/billing",
+            ),
+        )
+        monkeypatch.setattr(au, "_fetch_nous_credits_snapshot", lambda timeout=10.0: snap)
+        line = au.nous_credits_compact_line()
+        assert line == (
+            "Nous credits (Ultra): Total usable: $988.99 · Renews: 2026-06-11T08:14:55.000Z"
+        )
+
+    def test_none_when_no_snapshot(self, monkeypatch):
+        import agent.account_usage as au
+
+        monkeypatch.setattr(au, "_fetch_nous_credits_snapshot", lambda timeout=10.0: None)
+        assert au.nous_credits_compact_line() is None
