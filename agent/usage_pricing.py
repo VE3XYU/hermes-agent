@@ -849,6 +849,73 @@ def estimate_usage_cost(
     )
 
 
+def _finite_nonneg_number(value: Any) -> Optional[float]:
+    """Return ``value`` as a float when it is a real, finite, non-negative
+    number (int/float, not bool); otherwise None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")) or f < 0:
+        return None
+    return f
+
+
+def extract_provider_cost_usd(response_usage: Any) -> Optional[float]:
+    """Provider-REPORTED cost (USD) from a response ``usage`` object, or None.
+
+    Reads the ``usage.cost`` field that OpenRouter's usage accounting returns
+    (``usage: {"include": true}`` request param; OpenRouter credits are 1:1
+    USD). OpenRouter-compatible aggregators use the same field. This NEVER
+    estimates: when the provider reports nothing, the result is None — callers
+    must treat None as "no cost data", not zero. A reported ``0`` is a real
+    zero (e.g. free-tier models) and is returned as ``0.0``.
+    """
+    if response_usage is None:
+        return None
+    cost = getattr(response_usage, "cost", None)
+    if cost is None and isinstance(response_usage, dict):
+        cost = response_usage.get("cost")
+    return _finite_nonneg_number(cost)
+
+
+def real_session_cost_usd(agent: Any) -> Optional[float]:
+    """Session-cumulative provider-REPORTED cost in USD, or None.
+
+    Combines the two real sources Hermes has — no estimation, ever:
+      - ``agent.session_actual_cost_usd``: per-response ``usage.cost``
+        accumulator (OpenRouter usage accounting).
+      - Nous ``x-nous-credits-*`` header delta via
+        ``agent.get_credits_spent_micros()`` (account-level spend since the
+        session first saw a header; clamped at 0 so a mid-session top-up
+        doesn't render a negative cost).
+
+    Returns None when neither source has reported anything — callers must
+    hide their cost display in that case rather than showing $0.00.
+    """
+    total: Optional[float] = None
+
+    actual = _finite_nonneg_number(getattr(agent, "session_actual_cost_usd", None))
+    if actual is not None:
+        total = actual
+
+    try:
+        spent_micros = agent.get_credits_spent_micros()
+    except Exception:
+        spent_micros = None
+    if spent_micros is not None:
+        try:
+            spent_usd = max(0, int(spent_micros)) / 1_000_000
+        except (TypeError, ValueError):
+            spent_usd = None
+        if spent_usd is not None:
+            total = (total or 0.0) + spent_usd
+
+    return total
+
+
 def has_known_pricing(
     model_name: str,
     provider: Optional[str] = None,

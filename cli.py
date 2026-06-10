@@ -10638,14 +10638,13 @@ class HermesCLI:
         compressions = compressor.compression_count
 
         msg_count = len(self.conversation_history)
-        cost_result = estimate_usage_cost(
+        # Cost — provider-REPORTED only (OpenRouter usage.cost accumulator
+        # and/or Nous credits-header delta). No estimation: an unreported
+        # cost shows as "not reported", never a fabricated dollar figure.
+        from agent.usage_pricing import real_session_cost_usd, resolve_billing_route
+        real_cost_usd = real_session_cost_usd(agent)
+        _billing_route = resolve_billing_route(
             agent.model,
-            CanonicalUsage(
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cache_read_tokens=cache_read_tokens,
-                cache_write_tokens=cache_write_tokens,
-            ),
             provider=getattr(agent, "provider", None),
             base_url=getattr(agent, "base_url", None),
         )
@@ -10665,21 +10664,16 @@ class HermesCLI:
         print(f"  Total tokens:              {total:>10,}")
         print(f"  API calls:                 {calls:>10,}")
         print(f"  Session duration:          {elapsed:>10}")
-        print(f"  Cost status:              {cost_result.status:>10}")
-        print(f"  Cost source:              {cost_result.source:>10}")
-        if cost_result.amount_usd is not None:
-            prefix = "~" if cost_result.status == "estimated" else ""
-            print(f"  Total cost:              {prefix}${float(cost_result.amount_usd):>10.4f}")
-        elif cost_result.status == "included":
-            print(f"  Total cost:              {'included':>10}")
+        if real_cost_usd is not None:
+            print(f"  Cost (provider-reported): ${real_cost_usd:>9.4f}")
+        elif _billing_route.billing_mode == "subscription_included":
+            print(f"  Cost:                    {'included':>11}")
         else:
-            print(f"  Total cost:              {'n/a':>10}")
+            print(f"  Cost:        {'not reported by provider':>23}")
         print(f"  {'─' * 40}")
         print(f"  Current context:  {last_prompt:,} / {ctx_len:,} ({pct:.0f}%)")
         print(f"  Messages:         {msg_count}")
         print(f"  Compressions:     {compressions}")
-        if cost_result.status == "unknown":
-            print(f"  Note:             Pricing unknown for {agent.model}")
 
         # Account limits -- fetched off-thread with a hard timeout so slow
         # provider APIs don't hang the prompt.

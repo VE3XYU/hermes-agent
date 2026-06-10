@@ -21,10 +21,15 @@ def _make_mock_agent(**overrides):
         "session_output_tokens": 10_000,
         "session_cache_read_tokens": 5_000,
         "session_cache_write_tokens": 2_000,
+        # Real provider-reported cost: None = nothing reported (the default).
+        "session_actual_cost_usd": None,
     }
     defaults.update(overrides)
     for k, v in defaults.items():
         setattr(agent, k, v)
+
+    # No Nous credits headers seen unless a test overrides this.
+    agent.get_credits_spent_micros = MagicMock(return_value=None)
 
     # Rate limit state
     rl = MagicMock()
@@ -72,13 +77,11 @@ class TestUsageCachedAgent:
 
     @pytest.mark.asyncio
     async def test_cached_agent_shows_detailed_usage(self):
-        agent = _make_mock_agent()
+        agent = _make_mock_agent(session_actual_cost_usd=0.1234)
         runner = _make_runner(SK, cached_agent=agent)
         event = MagicMock()
 
-        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"), \
-             patch("agent.usage_pricing.estimate_usage_cost") as mock_cost:
-            mock_cost.return_value = MagicMock(amount_usd=0.1234, status="estimated")
+        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"):
             result = await runner._handle_usage_command(event)
 
         assert "claude-sonnet-4.6" in result
@@ -99,9 +102,7 @@ class TestUsageCachedAgent:
         runner = _make_runner(SK, agent=running, cached_agent=cached)
         event = MagicMock()
 
-        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"), \
-             patch("agent.usage_pricing.estimate_usage_cost") as mock_cost:
-            mock_cost.return_value = MagicMock(amount_usd=None, status="unknown")
+        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"):
             result = await runner._handle_usage_command(event)
 
         assert "80,000" in result   # running agent's total
@@ -117,9 +118,7 @@ class TestUsageCachedAgent:
         runner._running_agents[SK] = _AGENT_PENDING_SENTINEL
         event = MagicMock()
 
-        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"), \
-             patch("agent.usage_pricing.estimate_usage_cost") as mock_cost:
-            mock_cost.return_value = MagicMock(amount_usd=None, status="unknown")
+        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"):
             result = await runner._handle_usage_command(event)
 
         assert "claude-sonnet-4.6" in result
@@ -153,9 +152,7 @@ class TestUsageCachedAgent:
         runner = _make_runner(SK, cached_agent=agent)
         event = MagicMock()
 
-        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"), \
-             patch("agent.usage_pricing.estimate_usage_cost") as mock_cost:
-            mock_cost.return_value = MagicMock(amount_usd=None, status="unknown")
+        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"):
             result = await runner._handle_usage_command(event)
 
         assert "Cache read" not in result
@@ -168,9 +165,7 @@ class TestUsageCachedAgent:
         runner = _make_runner(SK, cached_agent=agent)
         event = MagicMock()
 
-        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"), \
-             patch("agent.usage_pricing.estimate_usage_cost") as mock_cost:
-            mock_cost.return_value = MagicMock(amount_usd=None, status="included")
+        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"):
             result = await runner._handle_usage_command(event)
 
         assert "Cost: included" in result
@@ -199,9 +194,7 @@ class TestUsageAccountSection:
                 "Session: 85% remaining (15% used)",
             ],
         )
-        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"), \
-             patch("agent.usage_pricing.estimate_usage_cost") as mock_cost:
-            mock_cost.return_value = MagicMock(amount_usd=None, status="included")
+        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"):
             result = await runner._handle_usage_command(event)
 
         assert "📊 **Session Token Usage**" in result
@@ -256,3 +249,42 @@ class TestUsageAccountSection:
         assert account_call["kwargs"]["base_url"] == "https://chatgpt.com/backend-api/codex"
         assert "📊 **Session Info**" in result
         assert "📈 **Account limits**" in result
+
+
+class TestUsageRealCostOnly:
+    """Cost lines are provider-REPORTED only — never estimated, never $0.00."""
+
+    @pytest.mark.asyncio
+    async def test_unreported_cost_renders_no_cost_line(self):
+        agent = _make_mock_agent()  # openrouter, nothing reported
+        runner = _make_runner(SK, cached_agent=agent)
+        event = MagicMock()
+
+        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"):
+            result = await runner._handle_usage_command(event)
+
+        assert "Cost:" not in result
+        assert "$0.00" not in result
+
+    @pytest.mark.asyncio
+    async def test_nous_credits_delta_renders_as_cost(self):
+        agent = _make_mock_agent(provider="nous", model="Hermes-4.1-405B")
+        agent.get_credits_spent_micros = MagicMock(return_value=123_400)
+        runner = _make_runner(SK, cached_agent=agent)
+        event = MagicMock()
+
+        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"):
+            result = await runner._handle_usage_command(event)
+
+        assert "$0.1234" in result
+
+    @pytest.mark.asyncio
+    async def test_openrouter_reported_cost_renders(self):
+        agent = _make_mock_agent(session_actual_cost_usd=0.9876)
+        runner = _make_runner(SK, cached_agent=agent)
+        event = MagicMock()
+
+        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"):
+            result = await runner._handle_usage_command(event)
+
+        assert "$0.9876" in result

@@ -523,7 +523,7 @@ class TestCLIStatusBar:
 
 
 class TestCLIUsageReport:
-    def test_show_usage_includes_estimated_cost(self, capsys):
+    def test_show_usage_reports_real_provider_cost(self, capsys):
         cli_obj = _attach_agent(
             _make_cli(),
             prompt_tokens=10_230,
@@ -535,20 +535,22 @@ class TestCLIUsageReport:
             compressions=1,
         )
         cli_obj.verbose = False
+        # Provider-reported cost (e.g. OpenRouter usage accounting accumulator).
+        cli_obj.agent.session_actual_cost_usd = 0.0640
 
         cli_obj._show_usage()
         output = capsys.readouterr().out
 
         assert "Model:" in output
-        assert "Cost status:" in output
-        assert "Cost source:" in output
-        assert "Total cost:" in output
+        assert "Cost (provider-reported):" in output
         assert "$" in output
         assert "0.064" in output
         assert "Session duration:" in output
         assert "Compressions:" in output
 
-    def test_show_usage_marks_unknown_pricing(self, capsys):
+    def test_show_usage_unreported_cost_is_not_a_dollar_figure(self, capsys):
+        """No estimation: when the provider reports nothing, /usage must NOT
+        fabricate a dollar amount — not even $0.00."""
         cli_obj = _attach_agent(
             _make_cli(model="local/my-custom-model"),
             prompt_tokens=1_000,
@@ -563,13 +565,15 @@ class TestCLIUsageReport:
         cli_obj._show_usage()
         output = capsys.readouterr().out
 
-        assert "Total cost:" in output
-        assert "n/a" in output
-        assert "Pricing unknown for local/my-custom-model" in output
+        assert "not reported by provider" in output
+        assert "Cost (provider-reported):" not in output
+        assert "$0.00" not in output
 
-    def test_zero_priced_provider_models_stay_unknown(self, capsys):
+    def test_show_usage_never_estimates_even_with_known_pricing(self, capsys):
+        """A model with a pricing-table entry must still show NO cost when the
+        provider reported nothing (hard requirement: real cost only)."""
         cli_obj = _attach_agent(
-            _make_cli(model="glm-5"),
+            _make_cli(model="anthropic/claude-sonnet-4-6"),
             prompt_tokens=1_000,
             completion_tokens=500,
             total_tokens=1_500,
@@ -582,9 +586,8 @@ class TestCLIUsageReport:
         cli_obj._show_usage()
         output = capsys.readouterr().out
 
-        assert "Total cost:" in output
-        assert "n/a" in output
-        assert "Pricing unknown for glm-5" in output
+        assert "not reported by provider" in output
+        assert "Cost (provider-reported):" not in output
 
 
 class TestStatusBarWidthSource:

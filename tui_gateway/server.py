@@ -1709,23 +1709,17 @@ def _get_usage(agent) -> dict:
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(ctx_used / ctx_max * 100)))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
+    # Cost: provider-REPORTED only (OpenRouter usage.cost accumulator and/or
+    # the Nous x-nous-credits-* header delta). Never estimated. When nothing
+    # was reported `cost_usd` is ABSENT (not $0.00) and the TUI hides its
+    # cost segment — that's the intended UX.
     try:
-        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+        from agent.usage_pricing import real_session_cost_usd
 
-        cost = estimate_usage_cost(
-            usage["model"],
-            CanonicalUsage(
-                input_tokens=usage["input"],
-                output_tokens=usage["output"],
-                cache_read_tokens=usage["cache_read"],
-                cache_write_tokens=usage["cache_write"],
-            ),
-            provider=getattr(agent, "provider", None),
-            base_url=getattr(agent, "base_url", None),
-        )
-        usage["cost_status"] = cost.status
-        if cost.amount_usd is not None:
-            usage["cost_usd"] = float(cost.amount_usd)
+        real_cost = real_session_cost_usd(agent)
+        if real_cost is not None:
+            usage["cost_usd"] = real_cost
+            usage["cost_status"] = "actual"
     except Exception:
         pass
     # Dev-only live credits-spent readout (L0 usage-aware-credits). Gated on

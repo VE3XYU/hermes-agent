@@ -13277,25 +13277,24 @@ class GatewayRunner(GatewayKanbanWatchersMixin):
             lines.append(t("gateway.usage.label_total", count=f"{agent.session_total_tokens:,}"))
             lines.append(t("gateway.usage.label_api_calls", count=agent.session_api_calls))
 
-            # Cost estimation
+            # Cost — provider-REPORTED only (OpenRouter usage.cost accumulator
+            # and/or Nous credits-header delta). No estimation: when nothing
+            # was reported the line is omitted entirely, never shown as $0.00.
+            # Subscription-included routes (a billing fact, not a price guess)
+            # still show "included".
             try:
-                from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
-                cost_result = estimate_usage_cost(
-                    agent.model,
-                    CanonicalUsage(
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        cache_read_tokens=cache_read,
-                        cache_write_tokens=cache_write,
-                    ),
-                    provider=getattr(agent, "provider", None),
-                    base_url=getattr(agent, "base_url", None),
-                )
-                if cost_result.amount_usd is not None:
-                    prefix = "~" if cost_result.status == "estimated" else ""
-                    lines.append(t("gateway.usage.label_cost", prefix=prefix, amount=f"{float(cost_result.amount_usd):.4f}"))
-                elif cost_result.status == "included":
-                    lines.append(t("gateway.usage.label_cost_included"))
+                from agent.usage_pricing import real_session_cost_usd, resolve_billing_route
+                real_cost = real_session_cost_usd(agent)
+                if real_cost is not None:
+                    lines.append(t("gateway.usage.label_cost", prefix="", amount=f"{real_cost:.4f}"))
+                else:
+                    route = resolve_billing_route(
+                        agent.model,
+                        provider=getattr(agent, "provider", None),
+                        base_url=getattr(agent, "base_url", None),
+                    )
+                    if route.billing_mode == "subscription_included":
+                        lines.append(t("gateway.usage.label_cost_included"))
             except Exception:
                 pass
 

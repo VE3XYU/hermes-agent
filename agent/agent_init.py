@@ -1620,6 +1620,12 @@ def init_agent(
     agent.session_cache_write_tokens = 0
     agent.session_reasoning_tokens = 0
     agent.session_estimated_cost_usd = 0.0
+    # Provider-REPORTED cost only (e.g. OpenRouter usage.cost). None means
+    # "nothing reported" — distinct from a real $0.00.
+    agent.session_actual_cost_usd = None
+    # Per-model session usage rows for /usage: {model: {calls, input, output,
+    # cache_read, cache_write, cost_usd|None}}.
+    agent.session_model_usage = {}
     agent.session_cost_status = "unknown"
     agent.session_cost_source = "none"
     
