@@ -1350,6 +1350,10 @@ export interface Translations {
       removeWorktreeConfirm: string
       removeWorktreeDirty: string
       forceRemove: string
+      archiveSessions: string
+      archiveSessionsConfirm: (count: number) => string
+      archiveSessionsDone: (count: number) => string
+      archiveSessionsFailed: string
       enter: (label: string) => string
       reorder: (label: string) => string
       toggle: (label: string) => string
@@ -1490,6 +1494,7 @@ export interface Translations {
       title: string
       noBranch: string
       detached: string
+      gone: string
       clean: string
       changed: (count: number) => string
       ahead: (count: number) => string
