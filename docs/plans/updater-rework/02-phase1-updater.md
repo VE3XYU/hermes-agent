@@ -41,9 +41,14 @@ Verbs (stubs returning `todo!` for now): `launch` (default), `install`,
 
 **Step 1 (failing tests first):** `resolve_tree_root(exe_path)` — walks up
 from the binary's real path (symlinks resolved) to the first dir containing
-either `manifest.json` (slot) or `pyproject.toml` + `.git` (checkout).
-Returns `TreeKind::Slot | TreeKind::Checkout` + root path. Test with tmpdir
-fixtures for: slot layout, checkout layout, worktree layout (`.git` FILE
+one of: `current.txt` (managed root — resolve the active version via
+`resolve_current`, task 1.4, and recurse into `versions/<v>/`),
+`manifest.json` (slot), or `pyproject.toml` + `.git` (checkout).
+Returns `TreeKind::Slot | TreeKind::Checkout` + root path (the managed
+root always resolves to a Slot — the launcher never runs "from" the data
+dir itself). Test with tmpdir
+fixtures for: managed root (stable launcher beside `current.txt`), slot
+layout, checkout layout, worktree layout (`.git` FILE
 containing `gitdir:` — not a dir!), and neither (error).
 
 **Step 2:** run tests → fail. **Step 3:** implement. **Step 4:** pass.
@@ -129,27 +134,26 @@ fsync + rename to `versions/<v>`; `flip(version)`; `previous` link
 update; `gc(keep_n)` — never GC the targets of `current`/`previous`;
 `cleanup_stale_staging()`.
 
-**The flip, per platform (get this right — it is THE atomic commit
-point of the whole design):**
+**The flip (get this right — it is THE atomic commit point of the whole
+design):** ONE mechanism on every platform. `current.txt` at the slots
+root holds the active version string; the flip is write
+`current.txt.new` + fsync + rename over `current.txt`. File
+rename-over-existing is atomic everywhere (POSIX `rename()`, Windows
+`MoveFileExW(MOVEFILE_REPLACE_EXISTING)`), so there is no per-platform
+commit logic to diverge. Everything load-bearing resolves through one
+function — `resolve_current(root) -> version` — which reads
+`current.txt`. `previous.txt` is the same format; rollback is rewriting
+`current.txt` from it.
 
-- **POSIX**: create `current.new` symlink → `rename()` over `current`.
-  Atomic, done.
-- **Windows**: ⚠ the obvious port does NOT work. `MoveFileExW` +
-  `MOVEFILE_REPLACE_EXISTING` **cannot replace an existing directory
-  entry**, and a junction IS a directory entry — rename-over-existing
-  is a file-only trick on Windows. Do NOT ship a junction swap that
-  deletes-then-renames without crash recovery. Use a **`current.txt`
-  indirection file instead of a junction on Windows**: a one-line file
-  containing the active version string, replaced via write-temp +
-  `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` (atomic for files). The
-  launcher (task 1.1/1.2) reads `current.txt` on Windows and
-  `readlink(current)` on POSIX — both behind one
-  `resolve_current(root) -> version` function so nothing else cares.
-  (`FILE_RENAME_FLAG_POSIX_SEMANTICS` directory-rename is a possible
-  future upgrade but needs Win10 1607+ + NTFS + admin-free junction
-  handling — don't bet the commit point on it in v1. A junction may
-  still be *maintained* best-effort for user convenience/PATH-following,
-  but `current.txt` is the source of truth the flip commits.)
+Deliberately NOT a symlink/junction commit: a *directory* symlink can be
+atomically renamed over on POSIX but a junction cannot on Windows
+(`MOVEFILE_REPLACE_EXISTING` can't replace a directory entry;
+delete-then-rename has a crash window). Rather than two commit
+mechanisms with different failure modes, both platforms use the file.
+`flip()` MAY refresh a `current` convenience symlink for humans and
+shell tools after the commit, best-effort, where symlinks are free
+(POSIX); its absence or staleness must never matter — enforce that by
+making `resolve_current` the only reader in the codebase.
 
 **Step 2 (apply flow):** download → verify → stage → **preflight** →
 flip → restage self (task 1.6) → restart services (task 1.7). Preflight =
@@ -157,8 +161,8 @@ run the STAGED slot's `bin/hermes doctor --preflight` (task 1.5) and
 require exit 0. On any failure before the flip: delete staging, report,
 exit nonzero — `current` untouched.
 
-**Step 3:** `rollback` verb: flip `current` → target of `previous` (swap
-the two links). `status` verb: print current/previous versions, staged
+**Step 3:** `rollback` verb: rewrite `current.txt` from `previous.txt`
+(and swap). `status` verb: print current/previous versions, staged
 leftovers, channel, `--json` flag for machine consumption.
 
 **Step 4:** update-in-progress marker: hold
@@ -258,7 +262,8 @@ legacy until phase 2 sign-off.
 **Step 1:** Add `--bundle` flag: skip clone/venv/deps entirely; download
 the platform `hermes-updater` from the release, verify (sha256 published in
 the release), run `hermes-updater install --channel stable`, symlink
-`$(get_command_link_dir)/hermes -> $HERMES_HOME/current/bin/hermes`.
+`$(get_command_link_dir)/hermes -> $HERMES_HOME/bin/hermes` (the stable
+launcher, which resolves `current.txt`).
 
 **Step 2:** Manual verify on a scratch user/container:
 `bash scripts/install.sh --bundle --skip-setup` → `hermes --version` works,
@@ -277,16 +282,16 @@ with a bumped version string):
 
 ```
 1. hermes-updater install --source file://$FIXTURE --channel stable
-   → versions/v1, current→v1;  bin: hermes --version == v1
+   → versions/v1, current.txt says v1;  bin: hermes --version == v1
 2. Start `hermes serve` (background), record pid.
 3. hermes-updater apply --source file://$FIXTURE (v2 available)
-   → current→v2, previous→v1; the OLD serve process is still alive and
-     still running v1 code (assert via its /api status endpoint) until
-     restart — proving no in-place mutation.
+   → current.txt says v2, previous.txt says v1; the OLD serve process is
+     still alive and still running v1 code (assert via its /api status
+     endpoint) until restart — proving no in-place mutation.
 4. Restart serve → reports v2.
-5. hermes-updater rollback → current→v1; hermes --version == v1.
-6. Corrupt one file in a staged v3 → apply FAILS pre-flip; current
-   still →v1. (tamper test)
+5. hermes-updater rollback → current.txt says v1; hermes --version == v1.
+6. Corrupt one file in a staged v3 → apply FAILS pre-flip; current.txt
+   still says v1. (tamper test)
 7. kill -9 the updater mid-download (SIGKILL during a large fixture)
    → re-run apply succeeds; `.staging` was cleaned. (interrupt test)
 ```
@@ -297,9 +302,10 @@ with a bumped version string):
 
 ## Pitfalls
 
-- **The flip on Windows**: `current.txt` indirection, NOT a junction
-  rename (see task 1.4 — `MOVEFILE_REPLACE_EXISTING` can't replace a
-  directory entry). Test on a real Windows runner — WSL will lie to you.
+- **The flip is the `current.txt` file replace on every platform** — do
+  not introduce a symlink/junction commit path anywhere, even where it
+  would work (task 1.4). One mechanism, one `resolve_current` reader.
+  Still test on a real Windows runner — WSL will lie to you.
 - **Do not add Tauri deps** to the launcher crate; it must build in seconds
   and produce a <5MB static-ish binary (musl target for linux).
 - The marker file format must stay byte-compatible with

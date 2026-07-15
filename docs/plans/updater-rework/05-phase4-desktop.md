@@ -104,7 +104,8 @@ orchestration (superseded by hermes-updater)`.
 - Modify: `apps/desktop/electron/backend-command.ts`, `main.ts`
 
 **Step 1:** For slot installs the backend is ALWAYS
-`$HERMES_HOME/current/bin/hermes serve ...` — the launcher resolves env,
+`$HERMES_HOME/bin/hermes serve ...` — the stable launcher resolves
+`current.txt` and the env,
 so `pathWithHermesManagedNode` / venv-path assembly for the child is
 unnecessary on this path. KEEP `sourceDeclaresServe`/`dashboardFallbackArgs`
 for now (legacy checkouts still exist until sunset) but route: slot →

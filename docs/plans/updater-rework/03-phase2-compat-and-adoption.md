@@ -200,7 +200,8 @@ plumbing too, and the updater already speaks `--source`.
 3. re-point the PATH symlink: find the existing `hermes` link
    (`get_command_link_dir()` equivalents: `~/.local/bin`, `/usr/local/bin`,
    Termux prefix — port the resolution) and re-target it to
-   `$HERMES_HOME/current/bin/hermes`; keep a `.pre-adopt-target` note file
+   `$HERMES_HOME/bin/hermes` (the stable launcher — it resolves
+   `current.txt` per task 1.4); keep a `.pre-adopt-target` note file
    recording the old target for one-command undo;
 4. DO NOT touch the checkout (assert in E2E: tree hash identical before/
    after);

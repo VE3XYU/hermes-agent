@@ -70,8 +70,8 @@ for a second worktree.
 
 **Step 1:** Replace the image's build stages with: fetch (or COPY from CI
 artifact) the `linux-<arch>` bundle → verify → unpack to `/opt/hermes` as
-a single baked slot (`current` → the one version). Entrypoint =
-`/opt/hermes/current/bin/hermes`. Keep: the baked `docker`
+a single baked slot (`current.txt` naming the one version). Entrypoint =
+`/opt/hermes/bin/hermes`. Keep: the baked `docker`
 `.install_method` stamp, `/opt/data` as `HERMES_HOME`.
 
 **Step 2:** `hermes update` / `/update` in-container behavior is already

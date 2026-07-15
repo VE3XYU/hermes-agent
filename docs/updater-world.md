@@ -279,9 +279,9 @@ in-app), and they drift.
      caveats, and the updater degrades gracefully into "you own this now"
      with helpful tooling instead of pretending it's still managed.
 3. **Atomic switch, not in-place mutation.** New version installs *next to*
-   the old one; a symlink flip (POSIX) or an atomic indirection-file
-   replace (Windows — see §2.2) is the commit point. The running
-   process never modifies the code it is executing.
+   the old one; atomically replacing a `current.txt` indirection file is
+   the commit point — the same mechanism on every platform (§2.2). The
+   running process never modifies the code it is executing.
 4. **One dependency manifest** consumed by every surface, instead of version
    floors and URLs copy-pasted across install.sh / install.ps1 / main.ts /
    Rust.
@@ -336,14 +336,20 @@ $HERMES_HOME/
 ├── versions/
 │   ├── 1.42.0/            # unpacked bundle (immutable after verify)
 │   └── 1.43.0/
-├── current -> versions/1.43.0        # symlink (POSIX); on Windows the commit
-│                                     #   point is a `current.txt` indirection
-│                                     #   file (rename-over-existing is atomic
-│                                     #   for files only there — a junction
-│                                     #   cannot be replaced atomically; see
-│                                     #   the phase-1 spec, task 1.4)
-├── previous -> versions/1.42.0      # instant rollback target
-├── bin/hermes             # stable shim: exec "$HERMES_HOME/current/bin/hermes" "$@"
+├── current.txt                       # THE commit point, all platforms: one
+│                                     #   line, the active version string,
+│                                     #   replaced by atomic rename (atomic
+│                                     #   for files everywhere — a dir
+│                                     #   symlink/junction rename is not
+│                                     #   atomic on Windows, so we don't
+│                                     #   build on it anywhere)
+├── previous.txt                      # instant rollback target, same format
+├── current -> versions/1.43.0        # convenience symlink for humans and
+│                                     #   shell tools; refreshed best-effort
+│                                     #   AFTER the commit, never read by
+│                                     #   launcher/updater code
+├── bin/hermes             # stable launcher: reads current.txt, execs
+│                          #   versions/<v>/bin/hermes (same binary; §2.5.1)
 └── (config.yaml, .env, skills/, sessions/… unchanged — data dir stays as-is)
 ```
 
@@ -357,25 +363,28 @@ The update algorithm becomes boring, which is the point:
    validates config compat, checks data-migration needs. This replaces the
    post-pull syntax guard — and it tests the *actual artifact*, not just
    py_compile of a hardcoded critical-file list.
-4. Flips the `current` link. This is the single atomic commit point.
+4. Commits: atomically replaces `current.txt` with the new version string
+   (write `current.txt.new`, rename over — atomic for files on every
+   platform). This is the single commit point. The convenience `current`
+   symlink is refreshed best-effort afterwards; nothing load-bearing
+   reads it.
 5. Restarts services (below). Old version stays in `versions/` — `hermes
-   update --rollback` is a link flip back, replacing today's
-   git-reflog-archaeology recovery instructions. Keep last N=2.
+   update --rollback` rewrites `current.txt` from `previous.txt`, replacing
+   today's git-reflog-archaeology recovery instructions. Keep last N=2.
 
 What this deletes from the current world:
 
 - **The entire update-boundary class.** Running processes keep executing the
-  old tree (their `sys.path` resolved through the link at exec time — the
-  launcher resolves `current` to its target before exec, so a mid-run flip
-  doesn't swap modules under anyone). `_UvResult`, retry-once, importlib
+  old tree (the launcher resolves `current.txt` to a concrete
+  `versions/<v>` path before exec, so a mid-run flip doesn't swap modules
+  under anyone). `_UvResult`, retry-once, importlib
   reload, bytecode purge, code_skew: all unnecessary. New code only ever runs
   in a fresh process.
 - **The Windows lock war, mostly.** Nothing ever writes into the tree a
   running process has mapped; the new version unpacks into a fresh directory.
-  The only lock-sensitive moment is the flip commit (on Windows an
-  atomic file replace of the `current.txt` indirection — open `.pyd`s in
-  the *old* slot don't block it because nothing renames over them) and
-  the stable shim itself,
+  The only lock-sensitive moment is the `current.txt` replace (atomic file
+  rename — open `.pyd`s in the *old* slot don't block it because nothing
+  renames over them) and the stable launcher itself,
   which is never rewritten during update. `--force`, `--force-venv`,
   gateway pause/resume, venv-holder detection: gone. Old versions are
   garbage-collected on a *later* run when no process has them open.
@@ -383,7 +392,7 @@ What this deletes from the current world:
   autostash, unmerged-index recovery: gone (moved to ejected mode where
   they belong — see 2.5).
 - **Interrupted-update recovery.** An interrupted download/unpack leaves a
-  `.staging` dir that gets deleted and retried; `current` never pointed at
+  `.staging` dir that gets deleted and retried; `current.txt` never named
   it. The breadcrumb-marker + launch-time-repair machinery goes away.
 
 ## 2.3 The updater as a separate tiny program
@@ -522,7 +531,7 @@ sequencing explicit and updater-driven:
 
 `hermes eject` sets up a source checkout and points your PATH `hermes`
 symlink at its in-repo launcher (the mechanism is §2.5.1 — going back to
-managed is re-pointing the symlink at `$HERMES_HOME/current/bin/hermes`;
+managed is re-pointing the symlink at `$HERMES_HOME/bin/hermes`;
 the ejected tree is kept):
 
 ```
@@ -537,7 +546,8 @@ $HERMES_HOME/                          # data dir, unchanged
 Semantics:
 
 - **Detection is where the launcher lives**, not fragile method-sniffing:
-  under `$HERMES_HOME/versions/` = managed, inside a `.git` tree = ejected
+  at `$HERMES_HOME/bin/hermes` (beside `versions/` + `current.txt`) =
+  managed, inside a `.git` tree = ejected
   (see §2.5.1). `detect_install_method()` keeps docker/nix/brew but the
   git-vs-pip guessing collapses.
 - **Ejected updates are today's `hermes update`, honestly scoped** — but see
@@ -585,7 +595,8 @@ install.ps1, main.ts, and every bootstrap stage subprocess.
 
 ```
 # managed (default):
-~/.local/bin/hermes -> $HERMES_HOME/current/bin/hermes     # flip-updated slots
+~/.local/bin/hermes -> $HERMES_HOME/bin/hermes     # stable launcher; reads
+                                                   #   current.txt → active slot
 
 # ejected / dev — indistinguishable from any git-cloned tool:
 ~/.local/bin/hermes -> ~/src/hermes-agent/bin/hermes
@@ -597,7 +608,7 @@ That's the whole mechanism. "Eject" is: clone the repo, provision it
 (`hermes dev sync` inside the checkout: per-tree `.venv` via the managed
 uv + managed Python, node deps, builds), and point your symlink at it.
 Going back to managed is pointing the symlink back at
-`$HERMES_HOME/current/bin/hermes`. `hermes eject` can automate exactly
+`$HERMES_HOME/bin/hermes`. `hermes eject` can automate exactly
 those steps for the casual case, but there is no special state to be in —
 `which hermes` + one readlink IS the mode detection.
 
@@ -621,16 +632,19 @@ Consequences:
   *fast*, so a mispointed symlink can't put the gateway supervisor into an
   ImportError respawn loop (restart_loop_guard's job gets easier, not
   harder).
-- **Mode detection collapses.** managed = launcher lives under
-  `$HERMES_HOME/versions/`; ejected = anywhere else with a `.git`. That
+- **Mode detection collapses.** managed = launcher lives at
+  `$HERMES_HOME/bin/hermes` beside a `versions/` + `current.txt`;
+  ejected = anywhere else with a `.git`. That
   replaces `.install_method` stamp archaeology for the git/pip cases, and
-  `hermes update` scopes itself accordingly: under `versions/` it defers to
+  `hermes update` scopes itself accordingly: managed defers to
   `hermes-updater`; in a checkout it runs today's git flow against that
   checkout alone (and can decline politely on a dirty dev tree).
-- **Windows**: same binary, `hermes.exe`; the "symlink" is the launcher
-  copied/hardlinked into the link dir or a junction — same resolution rule,
+- **Windows**: same binary, `hermes.exe`; the activation "symlink" is the
+  launcher copied/hardlinked into the link dir — same resolution rule,
   and the stable-name-on-PATH property is what the current shim already
-  provides.
+  provides. (Activation is a rare, user-driven action, so copy semantics
+  are fine here — unlike the update flip, which is why the flip commits
+  through `current.txt` rather than any link, §2.2.)
 
 ### 2.5.2 Ejected updates: worktree instead of stash
 
@@ -974,8 +988,8 @@ invariant from the very first new-world operation. `adopt` then:
 
 1. downloads + verifies the bundle matching the checkout's release,
 2. creates `versions/<v>/`, runs `doctor --preflight` against it,
-3. points the PATH `hermes` symlink at `$HERMES_HOME/current/bin/hermes`
-   and flips `current`,
+3. points the PATH `hermes` symlink at `$HERMES_HOME/bin/hermes`
+   and commits `current.txt`,
 4. **leaves the old checkout completely untouched** — it is the rollback
    artifact (worst case: repoint the symlink back and you are exactly
    where you were) and, for users who later want it, the ready-made
@@ -983,8 +997,9 @@ invariant from the very first new-world operation. `adopt` then:
 5. restages itself (§2.3.1), restarts services (§2.4).
 
 Adoption failing at ANY step leaves a fully working old-world install:
-nothing about it is destructive until the symlink flip, and even that is
-reversible with one `ln -sf`.
+nothing about it is destructive until the PATH-symlink re-point, and even
+that is reversible with one `ln -sf` back at the old target (recorded in
+`.pre-adopt-target`).
 
 ### Per-cohort behavior
 
