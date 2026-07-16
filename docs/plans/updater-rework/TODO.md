@@ -8,11 +8,11 @@ This is an implementation checklist, not a record that the phases are complete. 
 
 ### Bundle and release contract
 
-- [ ] Make the Python manifest writer and Rust verifier agree about symlinks.
+- [x] Make the Python manifest writer and Rust verifier agree about symlinks.
   - `scripts/release/write-manifest.py:63-75,130-146` skips symlinks.
   - `apps/hermes-launcher/src/release.rs:457-467,503-515` follows file symlinks and rejects them as unsigned extras.
   - Reproduced: the Python verifier accepted a signed fixture while the Rust updater rejected `runtime/venv/bin/python` as an extra file.
-  - Cover a real relocatable venv containing the Python symlink through write → Python verify → archive → Rust apply.
+  - Covered: Rust `walkdir_inner` now uses `entry.file_type()` (lstat, non-following) to skip symlinks. Tests on both sides: `test_verify_bundle_with_symlinks` (Rust) + `test_bundle_with_file_symlink_verifies` (Python).
   - Spec: `01-phase0-bundles.md:271-280`.
 
 - [ ] Validate signed manifest identity before activation.
