@@ -1202,7 +1202,37 @@ def apply_ledger(venv_python: str | None = None) -> dict[str, str]:
                 parsed = json.loads(result.stdout)
             except json.JSONDecodeError as exc:
                 return {"_worker": f"failed: invalid JSON: {exc}"}
-            return parsed if isinstance(parsed, dict) else {"_worker": "failed: invalid result"}
+            if not isinstance(parsed, dict):
+                return {"_worker": "failed: invalid result"}
+            # The worker may have installed successfully while Python 3.12's
+            # importlib.metadata cache still reports the distribution missing.
+            # The worker has exited now, so reconcile those statuses in a new
+            # target-interpreter process — the same boundary the real runtime
+            # crosses after an update.
+            for feature, status in list(parsed.items()):
+                if not str(status).startswith("failed: install reported success"):
+                    continue
+                probe = subprocess.run(
+                    [
+                        str(target_python),
+                        "-c",
+                        (
+                            "import json,sys; from tools.lazy_deps import feature_missing; "
+                            "sys.stdout.write(json.dumps(feature_missing(sys.argv[1])))"
+                        ),
+                        feature,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=os.environ.copy(),
+                )
+                try:
+                    if probe.returncode == 0 and not json.loads(probe.stdout):
+                        parsed[feature] = "refreshed"
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return parsed
 
     results: dict[str, str] = {}
     for feature in ledger_features():
@@ -1242,34 +1272,7 @@ def _main() -> int:
     if sys.argv[1:] != ["--apply-ledger-json"]:
         print("usage: python -m tools.lazy_deps --apply-ledger-json", file=sys.stderr)
         return 2
-    results = apply_ledger()
-    # A just-installed distribution may remain invisible to this process's
-    # importlib.metadata cache on Python 3.12. Reconcile only failed install
-    # statuses in a fresh interpreter before reporting the worker result.
-    for feature, status in list(results.items()):
-        if not status.startswith("failed: install reported success"):
-            continue
-        probe = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import json,sys; from tools.lazy_deps import feature_missing; "
-                    "sys.stdout.write(json.dumps(feature_missing(sys.argv[1])))"
-                ),
-                feature,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=os.environ.copy(),
-        )
-        try:
-            if probe.returncode == 0 and not json.loads(probe.stdout):
-                results[feature] = "refreshed"
-        except (json.JSONDecodeError, TypeError):
-            pass
-    print(json.dumps(results, sort_keys=True))
+    print(json.dumps(apply_ledger(), sort_keys=True))
     return 0
 
 
