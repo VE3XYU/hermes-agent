@@ -9,7 +9,11 @@
 #
 # In BUNDLES, bin/hermes is the real native binary (phase 1).
 #
-# See docs/updater-world.md §2.5.1.
+# Cwd guard: if invoked from inside a git checkout, require --dev.
+# If running from $HOME with no checkout context, require --global or
+# default to managed.
+#
+# See docs/updater-world.md §2.5.1 and §04-phase3-ejected-dev.md.
 
 # --- env hygiene ---
 unset PYTHONPATH
@@ -19,10 +23,64 @@ export UV_NO_CONFIG=1
 DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$DIR/.." && pwd)"
 
+# --- cwd guard ---
+# Check if the caller's cwd is inside a git checkout.
+# Walk up from cwd looking for a .git (dir or file).
+has_dev_flag=0
+has_global_flag=0
+for arg in "$@"; do
+    case "$arg" in
+        --dev) has_dev_flag=1 ;;
+        --global) has_global_flag=1 ;;
+    esac
+done
+
+# Both flags → contradictory
+if [ "$has_dev_flag" = "1" ] && [ "$has_global_flag" = "1" ]; then
+    echo "hermes: --dev and --global are contradictory — pick one." >&2
+    exit 2
+fi
+
+# Walk up from cwd to find an enclosing hermes-agent checkout
+find_checkout() {
+    dir="$1"
+    while [ "$dir" != "/" ] && [ -n "$dir" ]; do
+        if [ -f "$dir/pyproject.toml" ] && grep -q "hermes-agent" "$dir/pyproject.toml" 2>/dev/null; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+CWD="$(pwd)"
+ENCLOSING_CHECKOUT="$(find_checkout "$CWD")"
+
+if [ -n "$ENCLOSING_CHECKOUT" ]; then
+    # Inside a checkout — require --dev or --global
+    if [ "$has_dev_flag" = "0" ] && [ "$has_global_flag" = "0" ]; then
+        echo "hermes: you are inside a hermes-agent checkout ($ENCLOSING_CHECKOUT)." >&2
+        echo "say which hermes you mean:" >&2
+        echo "  hermes --dev       run THIS checkout's ./bin/hermes" >&2
+        echo "  hermes --global    run the installed hermes (managed or PATH target)" >&2
+        exit 2
+    fi
+fi
+
+# Strip --dev and --global flags before forwarding (they're consumed by the guard)
+forward_args=""
+for arg in "$@"; do
+    case "$arg" in
+        --dev|--global) ;;  # consume
+        *) forward_args="$forward_args \"$arg\"" ;;
+    esac
+done
+
 # --- try native launcher (installed by dev sync) ---
 NATIVE="$REPO_ROOT/.hermes-launcher/hermes"
 if [ -x "$NATIVE" ]; then
-    exec "$NATIVE" "$@"
+    eval exec "\"$NATIVE\"" "$forward_args"
 fi
 
 # --- fallback: exec venv python directly ---
@@ -39,4 +97,4 @@ if [ ! -x "$VENV_PYTHON" ]; then
 fi
 
 export VIRTUAL_ENV="$(dirname "$(dirname "$VENV_PYTHON")")"
-exec "$VENV_PYTHON" -m hermes_cli.main "$@"
+eval exec "\"$VENV_PYTHON\"" -m hermes_cli.main "$forward_args"

@@ -1,5 +1,23 @@
 #!/usr/bin/env bash
-# Real packaged Electron updater gate: signed file:// v1 -> v2 under xvfb.
+#
+# PLACEHOLDER — this script is a known gap awaiting a real packaged Electron
+# updater E2E harness. It is NOT wired as a passing CI requirement.
+#
+# The real harness needs:
+#   - apps/desktop/e2e/desktop-update.mjs (does not exist yet)
+#   - A real venv interpreter (not a fake /bin/sh stub)
+#   - Playwright driver for the packaged Electron app under xvfb
+#
+# When the real harness lands, remove this guard and wire the script into CI.
+# Until then, exit early with a clear message.
+#
+echo "PLACEHOLDER: test-desktop-update.sh is not yet implemented." >&2
+echo "The real packaged Electron updater E2E harness is a separate workstream." >&2
+echo "See docs/plans/updater-rework/05-phase4-desktop.md task 4.5." >&2
+exit 1
+
+# The code below is the intended contract — kept for reference when the
+# real harness is built. It will NOT run because of the exit above.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

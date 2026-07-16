@@ -257,18 +257,21 @@ export function resolveInstallType(
     fileExists: (p: string) => boolean
   }
 ): InstallType {
-  const versionsDir = path_join(hermesHome, 'versions')
-  const currentTxt = path_join(hermesHome, 'current.txt')
-
-  // Slot: versions/ + current.txt at the hermes-home root.
-  if (probes.directoryExists(versionsDir) && probes.fileExists(currentTxt)) {
-    return 'slot'
-  }
-
-  // Checkout: a .git dir or .git file (worktree) inside the active root.
+  // Check the active tree FIRST. If the active root is a checkout (git repo
+  // or worktree), the desktop must route to the worktree/dev-update path —
+  // even if a managed-home slot layout also exists (e.g. mid-migration or
+  // coexistence). Only return 'slot' if the active tree is NOT a checkout.
   const gitDir = path_join(activeHermesRoot, '.git')
   if (probes.directoryExists(gitDir) || probes.fileExists(gitDir)) {
     return 'checkout'
+  }
+
+  // Slot: versions/ + current.txt at the hermes-home root, and the active
+  // tree is not a checkout (we checked above).
+  const versionsDir = path_join(hermesHome, 'versions')
+  const currentTxt = path_join(hermesHome, 'current.txt')
+  if (probes.directoryExists(versionsDir) && probes.fileExists(currentTxt)) {
+    return 'slot'
   }
 
   // Fallback: treat as package-managed (AppImage/.deb/.rpm/dev).

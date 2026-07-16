@@ -8,12 +8,14 @@
 # Usage: bash scripts/e2e/test-bundle-boot.sh <bundle-dir>
 #    or: bash scripts/e2e/test-bundle-boot.sh <bundle-archive.tar.zst>
 #
-# Requires: docker (or podman). If docker is not available, falls back to
-# a local check (less rigorous — the host has python/node installed).
+# Requires: docker (or podman). If neither is available, exits with an error
+# (the gate must run under container isolation — a host with python/node
+# installed cannot prove the bundle is self-contained).
 #
-# Phase 1 will add `bin/hermes doctor --preflight` — until then, the
-# python-import fallback line is the gate. Both lines stay so the script
-# tightens automatically when phase 1 lands.
+# This script FAILS CLOSED: every check is a hard error.
+#   - doctor --preflight failure → exit 1 (no fallback to import check)
+#   - missing manifest.json → exit 1 (no warning)
+#   - no docker/podman → exit 1 (no local fallback)
 
 set -euo pipefail
 
@@ -51,7 +53,7 @@ fi
 
 echo "==> Bundle: $BUNDLE_DIR"
 
-# ─── Try Docker first (the real gate) ──────────────────────────────────
+# ─── Require Docker or Podman (the real gate) ─────────────────────────
 
 CONTAINER_CMD=""
 if command -v docker &>/dev/null; then
@@ -60,63 +62,39 @@ elif command -v podman &>/dev/null; then
     CONTAINER_CMD="podman"
 fi
 
-if [ -n "$CONTAINER_CMD" ]; then
-    echo "==> Running in debian:stable-slim via $CONTAINER_CMD (no python/node/git)..."
-
-    BUNDLE_ABSOLUTE="$(cd "$BUNDLE_DIR" && pwd)"
-
-    $CONTAINER_CMD run --rm -v "$BUNDLE_ABSOLUTE:/b:ro" debian:stable-slim /bin/sh -c '
-        set -e
-        echo "--- Checking no system python/node/git ---"
-        which python3 2>/dev/null && echo "FAIL: python3 found on host" && exit 1 || true
-        which node 2>/dev/null && echo "FAIL: node found on host" && exit 1 || true
-        which git 2>/dev/null && echo "FAIL: git found on host" && exit 1 || true
-        echo "PASS: no system python/node/git"
-
-        echo "--- bin/hermes --version ---"
-        /b/bin/hermes --version
-
-        echo "--- doctor --preflight (phase 1; fallback to import check) ---"
-        HERMES_HOME=/tmp/hh /b/bin/hermes doctor --preflight 2>/dev/null || \
-        HERMES_HOME=/tmp/hh /b/runtime/venv/bin/python -c "import hermes_cli.main, run_agent, model_tools, gateway.run; print(\"PREFLIGHT_OK\")"
-
-        echo "--- manifest verification ---"
-        /b/runtime/venv/bin/python -c "import json; m=json.loads(open(\"/b/manifest.json\").read()); assert m[\"schema\"]==1; assert len(m.get(\"files\",{}))>0; print(\"MANIFEST_OK\")"
-
-        echo "E2E_PASS"
-    '
-    echo "==> Docker E2E gate passed!"
-    exit 0
+if [ -z "$CONTAINER_CMD" ]; then
+    echo "ERROR: docker/podman not available — cannot run the bare-container boot gate." >&2
+    echo "       This gate requires container isolation to prove the bundle is self-contained." >&2
+    echo "       A host with python/node installed cannot prove the bundle carries everything." >&2
+    exit 1
 fi
 
-# ─── Fallback: local check (host has python/node) ─────────────────────
+echo "==> Running in debian:stable-slim via $CONTAINER_CMD (no python/node/git)..."
 
-echo "WARN: docker/podman not available — running local fallback check" >&2
-echo "    (less rigorous: the host has python/node installed)" >&2
-echo ""
+BUNDLE_ABSOLUTE="$(cd "$BUNDLE_DIR" && pwd)"
 
-echo "--- bin/hermes --version ---"
-"$BUNDLE_DIR/bin/hermes" --version
+# Every check inside the container is a hard error — set -e is active.
+$CONTAINER_CMD run --rm -v "$BUNDLE_ABSOLUTE:/b:ro" debian:stable-slim /bin/sh -c '
+    set -e
+    echo "--- Checking no system python/node/git ---"
+    which python3 2>/dev/null && { echo "FAIL: python3 found on host"; exit 1; } || true
+    which node 2>/dev/null && { echo "FAIL: node found on host"; exit 1; } || true
+    which git 2>/dev/null && { echo "FAIL: git found on host"; exit 1; } || true
+    echo "PASS: no system python/node/git"
 
-echo "--- core imports ---"
-"$BUNDLE_DIR/runtime/venv/bin/python" -c "import hermes_cli.main, run_agent, model_tools, gateway.run; print('PREFLIGHT_OK')"
+    echo "--- bin/hermes --version ---"
+    /b/bin/hermes --version
 
-echo "--- doctor --preflight (phase 1; fallback to import check) ---"
-HERMES_HOME=/tmp/hh "$BUNDLE_DIR/bin/hermes" doctor --preflight 2>/dev/null || \
-    echo "    (doctor --preflight not yet available — import check above is the gate)"
+    echo "--- doctor --preflight ---"
+    HERMES_HOME=/tmp/hh /b/bin/hermes doctor --preflight
 
-echo "--- manifest check ---"
-if [ -f "$BUNDLE_DIR/manifest.json" ]; then
-    "$BUNDLE_DIR/runtime/venv/bin/python" -c "
-import json
-manifest = json.loads(open('$BUNDLE_DIR/manifest.json').read())
-assert manifest['schema'] == 1
-assert 'files' in manifest
-print(f'MANIFEST_OK: {len(manifest[\"files\"])} files')
-"
-else
-    echo "    WARN: manifest.json not found (run write-manifest.py first)"
-fi
+    echo "--- manifest verification ---"
+    if [ ! -f /b/manifest.json ]; then
+        echo "FAIL: manifest.json not found in bundle" >&2
+        exit 1
+    fi
+    /b/runtime/venv/bin/python -c "import json; m=json.loads(open(\"/b/manifest.json\").read()); assert m[\"schema\"]==1; assert len(m.get(\"files\",{}))>0; print(\"MANIFEST_OK\")"
 
-echo ""
-echo "E2E_PASS (local fallback)"
+    echo "E2E_PASS"
+'
+echo "==> Docker E2E gate passed!"

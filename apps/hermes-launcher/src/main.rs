@@ -23,6 +23,15 @@ fn hermes_home() -> anyhow::Result<PathBuf> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Sweep old .exe binaries from previous Windows restages at startup.
+    // On POSIX this is a no-op (no .old.exe files). On Windows, this cleans
+    // up leftover hermes-updater.old.exe files from previous restages that
+    // couldn't be removed because the running process had them locked.
+    if let Ok(home) = hermes_home() {
+        let bin_dir = home.join("bin");
+        let _ = crate::selfupdate::sweep_old_binaries(&bin_dir);
+    }
+
     let args = apply_cwd_guard()?;
     let cli = cli::parse_from(args);
 
@@ -330,14 +339,35 @@ fn apply(
     // critical section is mutually exclusive.
     let _marker = apply::UpdateMarker::acquire(&home)?;
     let argv: Vec<String> = std::env::args().collect();
-    let manifest = apply::apply_release(apply::ApplyRequest {
+
+    let manifest = match apply::apply_release(apply::ApplyRequest {
         hermes_home: &home,
         source: &source,
         version: version.as_deref(),
         channel: "stable",
         trusted_pubkey: trusted_release_pubkey()?,
         argv: Some(&argv),
-    })?;
+    }) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            // Item 9: Report terminal failures to detached gateway/desktop
+            // callers BEFORE returning the error. Write the exit code and
+            // error message to the notify files so the watcher can pick
+            // them up.
+            let error_message = format!("Update failed: {error:#}");
+            eprintln!("{error_message}");
+            if let Err(write_err) = services::write_notify_files(
+                &home,
+                1,
+                &error_message,
+                notify_file.as_deref(),
+            ) {
+                eprintln!("warning: cannot write failure notify files: {write_err}");
+            }
+            return Err(error);
+        }
+    };
+
     apply::activate_stable_launchers(&home, &manifest.version)?;
     if let Err(error) = apply::apply_feature_ledger(&home, &manifest.version) {
         eprintln!("warning: feature ledger application failed: {error:#}");
@@ -345,22 +375,117 @@ fn apply(
     if let Err(error) = services::restart_gateway(&home, &manifest.version) {
         eprintln!("warning: gateway restart failed: {error:#}");
     }
+
+    // Item 8: Wire slot GC into production. Run after a successful apply
+    // (after flip). Keep current/previous and the configured keep count
+    // (default 2). Tolerate locked old Windows slots for later runs.
+    let removed = slots::gc(&home, 2);
+    if let Ok(removed) = &removed {
+        if !removed.is_empty() {
+            println!("  GC removed old slots: {}", removed.join(", "));
+        }
+    } else if let Err(e) = &removed {
+        // GC failure is non-fatal — don't block the update.
+        eprintln!("warning: slot GC failed: {e}");
+    }
+
     services::write_notify_files(
         &home,
         0,
         &format!("Updated Hermes to {}", manifest.version),
         notify_file.as_deref(),
     )?;
+
+    // Item 14: Relaunch desktop from the newly active slot, not the old
+    // absolute executable. If the new slot has a desktop/ directory, spawn
+    // from there. Otherwise fall back to the provided path.
     if let Some(executable) = relaunch_app {
-        std::process::Command::new(executable).spawn()?;
+        let slot_desktop = slots::slot_path(&home, &manifest.version).join("desktop");
+        let launch_path = if slot_desktop.is_dir() {
+            // Find the desktop entry in the new slot's desktop/ directory.
+            // On POSIX this is typically an executable or shell script;
+            // on Windows it's an .exe.
+            let entries: Vec<_> = std::fs::read_dir(&slot_desktop)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .collect();
+            let desktop_entry = entries.into_iter().find_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                let path = e.path();
+                if cfg!(windows) {
+                    if name.ends_with(".exe") {
+                        Some(path)
+                    } else {
+                        None
+                    }
+                } else {
+                    // On POSIX, look for an executable file
+                    if path.is_file() {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            if let Ok(meta) = path.metadata() {
+                                if meta.permissions().mode() & 0o111 != 0 {
+                                    return Some(path);
+                                }
+                            }
+                        }
+                        None
+                    } else {
+                        None
+                    }
+                }
+            });
+            desktop_entry.unwrap_or_else(|| PathBuf::from(executable))
+        } else {
+            PathBuf::from(executable)
+        };
+        if let Err(e) = std::process::Command::new(&launch_path).spawn() {
+            eprintln!("warning: cannot relaunch desktop from {}: {e}", launch_path.display());
+        }
     }
     println!("Updated Hermes to {}", manifest.version);
     Ok(())
 }
 
 fn rollback() -> anyhow::Result<()> {
-    let hermes_home = hermes_home()?;
-    let version = slots::rollback(&hermes_home)?;
+    let home = hermes_home()?;
+    // Acquire the update marker so rollback is mutually exclusive with applies.
+    let _marker = apply::UpdateMarker::acquire(&home)?;
+
+    let version = match slots::rollback(&home) {
+        Ok(version) => version,
+        Err(error) => {
+            // Item 9: Report terminal failures to detached callers.
+            let error_message = format!("Rollback failed: {error:#}");
+            eprintln!("{error_message}");
+            if let Err(write_err) =
+                services::write_notify_files(&home, 1, &error_message, None)
+            {
+                eprintln!("warning: cannot write failure notify files: {write_err}");
+            }
+            return Err(error);
+        }
+    };
+
+    // Item 7: Give rollback the same post-flip lifecycle as apply.
+    // After rollback flip: activate stable launchers, restart gateway,
+    // write notify files, and relaunch desktop if applicable.
+    apply::activate_stable_launchers(&home, &version)?;
+    if let Err(error) = apply::apply_feature_ledger(&home, &version) {
+        eprintln!("warning: feature ledger application failed: {error:#}");
+    }
+    if let Err(error) = services::restart_gateway(&home, &version) {
+        eprintln!("warning: gateway restart failed: {error:#}");
+    }
+    services::write_notify_files(
+        &home,
+        0,
+        &format!("Rolled back Hermes to {}", version),
+        None,
+    )?;
+
     println!("Rolled back to {}", version);
     Ok(())
 }

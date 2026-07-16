@@ -438,6 +438,16 @@ def run_dev_update(
         print("→ Clean tree — fast-forwarding in place...")
         if _fast_forward_in_place(tree_root, branch):
             print("✓ Fast-forwarded successfully.")
+            # Run dev sync so deps, launcher, ledger, and frontend are
+            # brought up to date with the freshly-pulled code.
+            print("→ Running dev sync to update dependencies and builds...")
+            try:
+                _provision_worktree(tree_root, dev_sync_fn=dev_sync_fn)
+            except Exception as exc:
+                print(f"⚠ dev sync after fast-forward failed: {exc}")
+                print("  Run `hermes dev sync` manually to complete the update.")
+                result.errors.append(f"post-ff dev sync failed: {exc}")
+                return result
             result.success = True
             result.fast_forwarded = True
             return result

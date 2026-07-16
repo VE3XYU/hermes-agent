@@ -7,7 +7,7 @@
 //! See docs/updater-world.md §2.3.1.
 
 use anyhow::{bail, Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Check if the staged updater needs to hop to a newer version.
 /// Simple semver comparison: if manifest.min_updater_version > my_version, hop.
@@ -92,8 +92,13 @@ pub fn hop(bundle_dir: &Path, original_argv: &[String]) -> Result<()> {
 ///
 /// POSIX: write to `bin/.hermes-updater.new`, rename over the old path.
 ///   A running old instance keeps executing its unlinked inode happily.
-/// Windows: rename running exe to `.old.exe`, move new into place, sweep
-///   `.old.exe` best-effort now + on the next run.
+/// Windows: rename running exe to `.old.exe`, move the new one into place,
+///   sweep `.old.exe` best-effort now + on the next run.
+///
+/// Failure containment: on Windows, if the rename of the running exe fails,
+/// we do NOT copy the new binary into the canonical path — that would
+/// leave a corrupted file. Instead we return an error. The canonical
+/// working updater is preserved on every failure.
 pub fn self_restage(staged_path: &Path, new_binary: &Path) -> Result<()> {
     if !new_binary.exists() {
         bail!("new binary not found: {}", new_binary.display());
@@ -123,13 +128,45 @@ pub fn self_restage(staged_path: &Path, new_binary: &Path) -> Result<()> {
     #[cfg(not(unix))]
     {
         // Windows: can't overwrite a running exe, but CAN rename it.
+        // Safe sequence:
+        // 1. Copy the new binary to a temp path FIRST (prepare before mutating)
+        // 2. Rename the running exe → .old.exe (if it exists)
+        // 3. Rename the temp path → canonical path (the commit)
+        // 4. Sweep .old.exe best-effort
+        //
+        // If step 2 fails, the canonical path is untouched — the old
+        // working updater is preserved.
+        // If step 3 fails after step 2, the canonical path is missing but
+        // .old.exe exists — the caller should restore from .old.exe.
+        let temp_path = staged_path.with_extension("new.exe");
         let old_path = staged_path.with_extension("old.exe");
-        // Try to rename the running exe
-        let _ = std::fs::rename(staged_path, &old_path);
-        // Move the new binary into place
-        std::fs::copy(new_binary, staged_path)
-            .with_context(|| format!("cannot copy to {}", staged_path.display()))?;
-        // Sweep .old.exe best-effort
+
+        // Step 1: Prepare the new binary at a temp path
+        std::fs::copy(new_binary, &temp_path)
+            .with_context(|| format!("cannot copy new binary to {}", temp_path.display()))?;
+
+        // Step 2: Rename the running exe out of the way (if it exists)
+        if staged_path.exists() {
+            std::fs::rename(staged_path, &old_path).with_context(|| {
+                format!(
+                    "cannot rename running exe {} to {} — canonical updater preserved",
+                    staged_path.display(),
+                    old_path.display()
+                )
+            })?;
+        }
+
+        // Step 3: Move the new binary into the canonical path
+        std::fs::rename(&temp_path, staged_path).with_context(|| {
+            format!(
+                "cannot move {} to canonical path {} — \
+                 if old.exe exists, restore from there",
+                temp_path.display(),
+                staged_path.display()
+            )
+        })?;
+
+        // Step 4: Sweep .old.exe best-effort (may fail if still locked)
         let _ = std::fs::remove_file(&old_path);
     }
 

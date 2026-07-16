@@ -98,9 +98,12 @@ fn has_git(dir: &Path) -> bool {
 ///   `<tree>/runtime/python/bin` (slot) or `$HERMES_HOME/node/bin` +
 ///   `$HERMES_HOME/bin` (checkout)
 /// - VIRTUAL_ENV: `<tree>/runtime/venv` (slot) or `<tree>/.venv` (checkout)
-/// - UV_PYTHON: same as VIRTUAL_ENV's python
+/// - UV_PYTHON: the actual interpreter binary path (not the venv dir)
 /// - UV_NO_CONFIG: 1
 /// - Remove PYTHONPATH, PYTHONHOME
+///
+/// Uses std::env::split_paths / std::env::join_paths for platform-native
+/// PATH separator handling (':' on POSIX, ';' on Windows).
 pub fn build_child_env(tree: &ResolvedTree) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = Vec::new();
 
@@ -126,18 +129,18 @@ pub fn build_child_env(tree: &ResolvedTree) -> Vec<(String, String)> {
             let python_bin = tree.root.join("runtime").join("python").join("bin");
             let venv = tree.root.join("runtime").join("venv");
 
-            // Prepend to PATH
+            // Prepend to PATH using platform-native path handling
             let current_path = std::env::var("PATH").unwrap_or_default();
-            let new_path = format!(
-                "{}:{}:{}:{}",
-                tools.display(),
-                node_bin.display(),
-                python_bin.display(),
-                current_path
+            let new_path = prepend_to_path(
+                &current_path,
+                &[&tools, &node_bin, &python_bin],
             );
             env.push(("PATH".to_string(), new_path));
             env.push(("VIRTUAL_ENV".to_string(), venv.to_string_lossy().into()));
-            env.push(("UV_PYTHON".to_string(), venv.to_string_lossy().into()));
+
+            // Set UV_PYTHON to the actual interpreter binary, not the venv dir.
+            let python_interpreter = venv_python(&venv);
+            env.push(("UV_PYTHON".to_string(), python_interpreter.to_string_lossy().into()));
         }
         TreeKind::Checkout => {
             let hermes_home = std::env::var("HERMES_HOME").unwrap_or_else(|_| {
@@ -147,22 +150,54 @@ pub fn build_child_env(tree: &ResolvedTree) -> Vec<(String, String)> {
                     .to_string_lossy()
                     .into()
             });
-            let node_bin = format!("{}/node/bin", hermes_home);
-            let bin_dir = format!("{}/bin", hermes_home);
-            let venv = tree.root.join(".venv");
+            let node_bin = std::path::PathBuf::from(&hermes_home).join("node").join("bin");
+            let bin_dir = std::path::PathBuf::from(&hermes_home).join("bin");
 
-            // Prepend to PATH
+            // Checkouts use .venv first, then legacy venv fallback
+            let venv = if tree.root.join(".venv").exists() {
+                tree.root.join(".venv")
+            } else {
+                tree.root.join("venv")
+            };
+
+            // Prepend to PATH using platform-native path handling
             let current_path = std::env::var("PATH").unwrap_or_default();
-            let new_path = format!("{}:{}:{}", node_bin, bin_dir, current_path);
+            let new_path = prepend_to_path(&current_path, &[&node_bin, &bin_dir]);
             env.push(("PATH".to_string(), new_path));
             env.push(("VIRTUAL_ENV".to_string(), venv.to_string_lossy().into()));
-            env.push(("UV_PYTHON".to_string(), venv.to_string_lossy().into()));
+
+            // Set UV_PYTHON to the actual interpreter binary, not the venv dir.
+            let python_interpreter = venv_python(&venv);
+            env.push(("UV_PYTHON".to_string(), python_interpreter.to_string_lossy().into()));
         }
     }
 
     env.push(("UV_NO_CONFIG".to_string(), "1".to_string()));
 
     env
+}
+
+/// Resolve the venv's python interpreter path.
+/// On POSIX: `<venv>/bin/python`
+/// On Windows: `<venv>/Scripts/python.exe`
+fn venv_python(venv: &Path) -> PathBuf {
+    if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin").join("python")
+    }
+}
+
+/// Prepend paths to an existing PATH string using platform-native separators.
+fn prepend_to_path(current: &str, paths: &[&Path]) -> String {
+    let mut components: Vec<PathBuf> = paths.iter().map(|p| p.to_path_buf()).collect();
+    // Parse the existing PATH into components
+    for existing in std::env::split_paths(current) {
+        components.push(existing);
+    }
+    std::env::join_paths(components)
+        .map(|joined| joined.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| current.to_string())
 }
 
 #[cfg(test)]
@@ -276,6 +311,21 @@ mod tests {
             .map(|(_, v)| v.clone())
             .unwrap();
         assert!(venv.ends_with("runtime/venv"));
+
+        // UV_PYTHON should point at the actual interpreter, not the venv dir
+        let uv_python: String = env
+            .iter()
+            .find(|(k, _)| k == "UV_PYTHON")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert!(
+            uv_python.ends_with("bin/python") || uv_python.ends_with("Scripts/python.exe"),
+            "UV_PYTHON should be the interpreter binary, got: {uv_python}"
+        );
+        assert!(
+            uv_python.contains("venv"),
+            "UV_PYTHON should be inside the venv, got: {uv_python}"
+        );
 
         assert!(env.iter().any(|(k, _)| k == "UV_NO_CONFIG"));
     }

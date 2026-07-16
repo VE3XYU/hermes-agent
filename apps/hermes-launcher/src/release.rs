@@ -448,8 +448,6 @@ fn verify_ed25519(manifest_bytes: &[u8], signature_b64: &str, pubkey_b64: &str) 
 /// Verify every file hash in the manifest matches the actual files.
 /// Also checks for extra files not in the manifest.
 fn verify_file_hashes(bundle_dir: &Path, manifest: &Manifest) -> Result<()> {
-    use sha2::{Digest, Sha256};
-
     let mut errors: Vec<String> = Vec::new();
 
     // Check every file in the manifest
@@ -510,11 +508,11 @@ fn compute_sha256(path: &Path) -> Result<String> {
 /// Recursively walk a directory, yielding all regular file paths.
 fn walkdir(dir: &Path) -> Vec<PathBuf> {
     let mut result = Vec::new();
-    walkdir_inner(dir, dir, &mut result);
+    walkdir_inner(dir, &mut result);
     result
 }
 
-fn walkdir_inner(root: &Path, dir: &Path, result: &mut Vec<PathBuf>) {
+fn walkdir_inner(dir: &Path, result: &mut Vec<PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -533,7 +531,7 @@ fn walkdir_inner(root: &Path, dir: &Path, result: &mut Vec<PathBuf>) {
                 if path.file_name().map(|n| n == ".staging").unwrap_or(false) {
                     continue;
                 }
-                walkdir_inner(root, &path, result);
+                walkdir_inner(&path, result);
             } else if file_type.is_file() {
                 result.push(path);
             }
@@ -547,8 +545,7 @@ mod tests {
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
-    use sha2::Sha256;
-    use std::io::Write;
+    use std::collections::HashMap;
 
     fn make_bundle_fixture(dir: &Path) {
         std::fs::create_dir_all(dir.join("runtime/venv/bin")).unwrap();

@@ -271,15 +271,24 @@ test('resolveInstallType: neither versions/ nor .git → package', () => {
   assert.equal(resolveInstallType('/home/u/.hermes', '/home/u/.hermes/hermes-agent', probes), 'package')
 })
 
-test('resolveInstallType: slot takes precedence over checkout', () => {
-  // If both versions/ + current.txt exist AND .git exists (mid-migration),
-  // the slot layout wins — the install has been adopted into managed mode.
+test('resolveInstallType: checkout takes precedence over slot (active tree checked first)', () => {
+  // If the active root is a checkout (.git exists), we return 'checkout'
+  // even if a managed-home slot layout also exists. The active tree
+  // determines the update path: checkout → dev-update, slot → updater.
   const probes = {
     directoryExists: (_p: string) => true,
     fileExists: (_p: string) => true
   }
 
-  assert.equal(resolveInstallType('/home/u/.hermes', '/home/u/.hermes/hermes-agent', probes), 'slot')
+  assert.equal(resolveInstallType('/home/u/.hermes', '/home/u/.hermes/hermes-agent', probes), 'checkout')
 })
 
+test('resolveInstallType: slot when active root is not a checkout but slot layout exists', () => {
+  // Slot layout exists (versions/ + current.txt) but active root has no .git.
+  const probes = {
+    directoryExists: (p: string) => p.endsWith('versions'),
+    fileExists: (p: string) => p.endsWith('current.txt')
+  }
 
+  assert.equal(resolveInstallType('/home/u/.hermes', '/home/u/.hermes/hermes-agent', probes), 'slot')
+})

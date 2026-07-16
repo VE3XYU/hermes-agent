@@ -7735,6 +7735,16 @@ def cmd_eject(args):
     _cmd_eject_impl(args)
 
 
+def cmd_dev(args):
+    """Developer commands for source checkouts (sync, status, gc).
+
+    Delegates to ``hermes_cli.subcommands.dev.cmd_dev``.
+    """
+    from hermes_cli.subcommands.dev import cmd_dev as _cmd_dev_impl
+
+    _cmd_dev_impl(args)
+
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version."""
     from hermes_cli.config import (
@@ -7786,6 +7796,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
     """Thin dispatcher — routes to the appropriate update mechanism."""
     from hermes_cli.config import detect_install_method
     from hermes_constants import get_hermes_home
+
+    # --in-place is deliberately removed: worktree updates are the only path
+    # for source checkouts, and if worktrees are unavailable the update fails
+    # closed rather than silently falling back to the legacy autostash flow.
+    if getattr(args, "in_place", False):
+        print(
+            "✗ --in-place is no longer supported.\n"
+            "  Source-checkout updates use worktrees exclusively; if the\n"
+            "  worktree path is unavailable, the update fails closed.\n"
+            "  To adopt managed release bundles instead, run: hermes adopt"
+        )
+        sys.exit(1)
 
     hermes_home = get_hermes_home()
     updater_name = "hermes-updater.exe" if sys.platform == "win32" else "hermes-updater"
@@ -11525,6 +11547,11 @@ def main():
     # eject command  (parser built in hermes_cli/subcommands/eject.py)
     # =========================================================================
     build_eject_parser(subparsers, cmd_eject=cmd_eject)
+
+    # =========================================================================
+    # dev command  (parser built in hermes_cli/subcommands/dev.py)
+    # =========================================================================
+    build_dev_parser(subparsers, cmd_dev=cmd_dev)
 
     # =========================================================================
     # uninstall command  (parser built in hermes_cli/subcommands/uninstall.py)

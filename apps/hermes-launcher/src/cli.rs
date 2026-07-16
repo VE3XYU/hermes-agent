@@ -5,8 +5,12 @@ use clap::{Parser, Subcommand};
 /// When invoked as `hermes` (default), the `launch` verb runs.
 /// When invoked as `hermes-updater` (argv[0] sniff), updater verbs
 /// are the default namespace.
+///
+/// Note: --version is NOT handled by Clap here. It falls through to the
+/// launch path which execs the Python CLI's --version, so the user sees
+/// the active Hermes tree's version, not the launcher's Cargo.toml version.
 #[derive(Parser, Debug)]
-#[command(name = "hermes", version, about, propagate_version = true)]
+#[command(name = "hermes", about, disable_version_flag = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -55,7 +59,6 @@ pub enum Command {
     },
 
     /// Apply an update: download, verify, stage, preflight, flip.
-    #[command(disable_version_flag = true)]
     Apply {
         /// Release source URL (https:// or file://).
         #[arg(long)]

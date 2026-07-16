@@ -47,10 +47,19 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
+      # Build the release bundle that the Dockerfile consumes as a named
+      # BuildKit context (`FROM hermes_bundle AS bundle`).  The Dockerfile
+      # has no source/venv/frontend build fallback — the bundle IS the
+      # runtime artifact.  See Dockerfile:3-8 and spec
+      # 06-phase5-ledger-and-sunset.md:65-85.
+      - name: Build release bundle
+        run: |
+          bash scripts/release/build-bundle.sh --out dist/bundle --no-desktop
+
       # Build once, load into the local daemon for testing.  Cached
       # per-arch; the push step below reuses every layer from this build.
       - name: Build image (${{ matrix.arch }})
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c0c18556b85f # v7.1.0
         with:
           context: .
           file: Dockerfile
@@ -59,6 +68,10 @@ jobs:
           tags: ${{ env.IMAGE_NAME }}:test
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
+          # The Dockerfile's `FROM hermes_bundle AS bundle` resolves to this
+          # local build-context directory (built in the step above).
+          build-contexts: |
+            hermes_bundle=dist/bundle
           cache-from: ${{ matrix.cache-from }}
           cache-to: ${{ (github.event_name != 'pull_request') && matrix.cache-to || '' }}
 
@@ -84,6 +97,9 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
+          # Same named BuildKit context as the test build above.
+          build-contexts: |
+            hermes_bundle=dist/bundle
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           cache-from: ${{ matrix.cache-from }}
           cache-to: ${{ matrix.cache-to }}

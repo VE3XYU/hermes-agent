@@ -1,0 +1,63 @@
+name: Bundle Boot E2E
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/e2e/test-bundle-boot.sh'
+      - 'scripts/release/build-bundle.sh'
+      - 'scripts/release/write-manifest.py'
+      - 'apps/hermes-launcher/**'
+      - 'Dockerfile'
+      - '.github/workflows/bundle-boot-e2e.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/e2e/test-bundle-boot.sh'
+      - 'scripts/release/build-bundle.sh'
+      - 'scripts/release/write-manifest.py'
+      - 'apps/hermes-launcher/**'
+      - 'Dockerfile'
+      - '.github/workflows/bundle-boot-e2e.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  bundle-boot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Build release bundle
+        run: |
+          bash scripts/release/build-bundle.sh --out dist/bundle --no-desktop
+
+      - name: Write + sign manifest
+        run: |
+          # Generate an ephemeral Ed25519 keypair for CI signing.
+          uv run --with pynacl python -c "
+          import base64, os
+          from nacl.signing import SigningKey
+          key = SigningKey.generate()
+          open('/tmp/signing.key', 'w').write(base64.b64encode(bytes(key)).decode())
+          open('/tmp/public.key', 'w').write(base64.b64encode(bytes(key.verify_key)).decode())
+          "
+          uv run --with pynacl python scripts/release/write-manifest.py \
+            --bundle-dir dist/bundle \
+            --version 0.0.0-ci \
+            --channel stable \
+            --git-sha "$(printf 'a%.0s' {1..40})" \
+            --platform linux-x64 \
+            --signing-key /tmp/signing.key
+
+      - name: Run bare-container boot gate
+        run: |
+          bash scripts/e2e/test-bundle-boot.sh dist/bundle

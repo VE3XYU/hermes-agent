@@ -49,12 +49,20 @@ pub fn launch(args: Vec<String>) -> Result<()> {
         std::process::exit(3);
     }
 
+    // Build the sanitized child environment BEFORE the health probe.
+    // The probe must run under the sanitized env so inherited
+    // PYTHONPATH/PYTHONHOME can't false-pass, false-fail, or poison the
+    // cached health stamp.
+    let env = build_child_env(&tree);
+
     // Self-check: verify core imports work (cached via .launcher-ok stamp)
     let stamp_ok = check_launcher_stamp(&tree, &python);
     if !stamp_ok {
         let result = Command::new(&python)
             .arg("-c")
             .arg("import hermes_cli")
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .output();
         match result {
             Ok(output) if output.status.success() => {
@@ -75,9 +83,6 @@ pub fn launch(args: Vec<String>) -> Result<()> {
             }
         }
     }
-
-    // Build the environment
-    let env = build_child_env(&tree);
 
     // Execute: python -m hermes_cli.main <args...>
     #[cfg(unix)]

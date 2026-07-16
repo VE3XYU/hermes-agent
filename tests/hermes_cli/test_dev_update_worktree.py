@@ -153,8 +153,15 @@ def dirty_repo_unstaged(tmp_path):
 class TestShouldUseWorktreeUpdate:
     """Tests for the routing decision: should we use the worktree path?"""
 
-    def test_returns_false_for_in_place_flag(self, clean_repo):
-        """--in-place forces the legacy flow."""
+    def test_in_place_flag_is_rejected(self, clean_repo):
+        """--in-place is removed: it should NOT route to the legacy flow.
+
+        The ``in_place`` parameter still exists in the function signature for
+        backward compat, but when True it returns False (fail-closed) rather
+        than enabling a legacy autostash fallback. The real enforcement
+        happens in ``_cmd_update_impl`` which exits with an error before
+        reaching ``should_use_worktree_update``.
+        """
         assert should_use_worktree_update(clean_repo, in_place=True) is False
 
     def test_returns_true_for_checkout_with_git(self, clean_repo):
@@ -178,12 +185,18 @@ class TestCleanTreeFastForward:
 
     def test_clean_tree_fast_forwards(self, clean_repo):
         """A clean tree should fast-forward without creating a worktree."""
+        sync_calls = []
+
+        def mock_sync(path):
+            sync_calls.append(path)
+
         result = run_dev_update(
             clean_repo,
             "main",
             in_place=False,
             choose=None,
             input_fn=lambda prompt, default: "1",
+            dev_sync_fn=mock_sync,
         )
 
         assert result.success is True
@@ -191,6 +204,9 @@ class TestCleanTreeFastForward:
         assert result.worktree_path is None
         # No worktree should have been created
         assert not (clean_repo / ".worktrees").exists()
+        # dev sync should have been called on the tree root after fast-forward
+        assert len(sync_calls) == 1
+        assert sync_calls[0] == clean_repo
 
     def test_clean_tree_no_choice_prompted(self, clean_repo):
         """Even with choose=None, clean tree doesn't prompt (fast-forwards)."""
@@ -207,6 +223,7 @@ class TestCleanTreeFastForward:
             in_place=False,
             choose=None,
             input_fn=fake_input,
+            dev_sync_fn=lambda p: None,
         )
 
         assert result.success is True
@@ -572,3 +589,21 @@ class TestGitStatusHelpers:
     def test_porcelain_status_empty_for_clean(self, clean_repo):
         status = _git_porcelain_status(clean_repo)
         assert status.strip() == ""
+
+
+# ---------------------------------------------------------------------------
+# Tests: --in-place is rejected (item 19)
+# ---------------------------------------------------------------------------
+
+class TestInPlaceRejected:
+    """``--in-place`` is removed and must error, not silently fall back."""
+
+    def test_in_place_exits_nonzero_in_cmd_update_impl(self, capsys):
+        """``_cmd_update_impl`` must exit(1) when ``--in-place`` is passed."""
+        from hermes_cli.main import _cmd_update_impl
+
+        args = SimpleNamespace(in_place=True, gateway=False)
+        with pytest.raises(SystemExit) as exc:
+            _cmd_update_impl(args, gateway_mode=False)
+        assert exc.value.code == 1
+        assert "--in-place" in capsys.readouterr().out

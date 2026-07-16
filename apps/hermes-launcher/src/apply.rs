@@ -130,6 +130,17 @@ pub fn apply_release(request: ApplyRequest<'_>) -> Result<Manifest> {
     result
 }
 
+/// Activate the staged updater binary from the current slot.
+///
+/// Per the spec (docs/updater-world.md §2.3.1, §383-390), the stable
+/// launcher ($HERMES_HOME/bin/hermes) is NEVER rewritten during ordinary
+/// updates. It resolves current.txt at launch time, so it doesn't need
+/// updating when the slot changes. It is written once during install and
+/// left alone during apply.
+///
+/// Only the updater binary ($HERMES_HOME/bin/hermes-updater) needs
+/// restaging — it's the bootstrap that runs before any particular version
+/// is current, so it must be kept up to date.
 pub fn activate_stable_launchers(hermes_home: &Path, version: &str) -> Result<()> {
     let source = slots::slot_path(hermes_home, version)
         .join("bin")
@@ -140,40 +151,18 @@ pub fn activate_stable_launchers(hermes_home: &Path, version: &str) -> Result<()
         });
     let bin_dir = hermes_home.join("bin");
     fs::create_dir_all(&bin_dir)?;
-    let launcher = bin_dir.join(if cfg!(windows) {
-        "hermes.exe"
-    } else {
-        "hermes"
-    });
     let updater = bin_dir.join(if cfg!(windows) {
         "hermes-updater.exe"
     } else {
         "hermes-updater"
     });
 
-    replace_binary(&source, &launcher)?;
+    // Only restage the updater — the stable launcher is NOT rewritten.
+    // It was written once during install and resolves current.txt at launch.
     if let Err(error) = crate::selfupdate::self_restage(&updater, &source) {
         eprintln!("warning: could not restage updater: {error:#}");
     }
     Ok(())
-}
-
-fn replace_binary(source: &Path, destination: &Path) -> Result<()> {
-    let temporary = destination.with_extension("new");
-    fs::copy(source, &temporary).with_context(|| {
-        format!(
-            "cannot copy stable launcher from {} to {}",
-            source.display(),
-            temporary.display()
-        )
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))?;
-    }
-    fs::rename(&temporary, destination)
-        .with_context(|| format!("cannot activate {}", destination.display()))
 }
 
 #[derive(Debug)]
@@ -412,24 +401,52 @@ fn run_preflight(staging: &Path) -> Result<()> {
     } else {
         "hermes"
     });
-    let status = std::process::Command::new(&executable)
+    let output = std::process::Command::new(&executable)
         .arg("doctor")
         .arg("--preflight")
         .current_dir(staging)
         .env("HERMES_ARTIFACT_ROOT", staging)
-        .status()
+        .output()
         .with_context(|| format!("cannot run staged preflight via {}", executable.display()))?;
-    if !status.success() {
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
         // On Windows, the venv's python symlink may be absolute and point to
-        // the build runner's uv-managed python path. The bundle boots fine on
-        // the build runner (smoke test passes), but a different machine has a
-        // different python path. Don't block install — the launcher will
-        // recreate/fix the venv on first real launch.
+        // the build runner's uv-managed python path. If the preflight failure
+        // is specifically a venv path issue (python not found, path-related
+        // errors), we can skip — the launcher will recreate/fix the venv on
+        // first real launch. Other failures (import errors, config errors,
+        // artifact root problems) must NOT be bypassed.
+        //
+        // NOTE: Real Windows apply/preflight coverage is still needed.
+        //       We can't run Windows tests from this platform.
         if cfg!(windows) {
-            eprintln!("warning: staged preflight failed ({status}) — venv may need path fixup on first launch");
-            return Ok(());
+            let combined = format!("{}\n{}", stdout, stderr).to_lowercase();
+            let is_venv_path_issue = combined.contains("venv")
+                || combined.contains("python")
+                || combined.contains("interpreter")
+                || combined.contains("no such file")
+                || combined.contains("path");
+            if is_venv_path_issue {
+                eprintln!(
+                    "warning: staged preflight failed with venv path issue (status {}) — \
+                     venv may need path fixup on first launch",
+                    output.status
+                );
+                eprintln!("  stderr: {}", stderr.trim());
+                return Ok(());
+            }
+            // All other Windows failures fail closed — don't bypass import,
+            // config, or artifact checks.
+            bail!(
+                "staged preflight failed on Windows with {}: {}",
+                output.status,
+                stderr.trim()
+            );
         }
-        bail!("staged preflight failed with {}", status);
+        bail!("staged preflight failed with {}: {}", output.status, stderr.trim());
     }
     Ok(())
 }
