@@ -27,7 +27,7 @@ import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import * as path from 'node:path'
 
-import { _electron, expect, type ElectronApplication, type Page, test } from '@playwright/test'
+import { _electron, expect, type ElectronApplication, type Page, test } from './test'
 
 import {
   buildAppEnv,
