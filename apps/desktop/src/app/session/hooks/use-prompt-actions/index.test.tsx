@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { textPart } from '@/lib/chat-messages'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
-import { $busy, $connection, $messages, $sessions, $turnStartedAt, setSessions } from '@/store/session'
+import { $notifications, clearNotifications } from '@/store/notifications'
+import { $busy, $connection, $currentUsage, $messages, $sessions, $turnStartedAt, setCurrentUsage, setMessages, setSessions } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
 import type { SubmitTextOptions } from './utils'
@@ -62,6 +63,7 @@ interface HarnessHandle {
   cancelRun: () => Promise<void>
   restoreToMessage: (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => Promise<void>
   steerPrompt: (text: string) => Promise<boolean>
+  submitTextRaw: (text: string, options?: SubmitTextOptions) => Promise<boolean>
   submitText: (text: string, options?: SubmitTextOptions) => Promise<boolean>
 }
 
@@ -98,7 +100,7 @@ function Harness({
   onSeedState?: (state: Record<string, unknown>) => void
   openMemoryGraph?: () => void
   refreshSessions: () => Promise<void>
-  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
   resumeStoredSession?: (storedSessionId: string) => Promise<void> | void
   seedMessages?: unknown[]
   selectedStoredSessionIdRef?: MutableRefObject<string | null>
@@ -162,6 +164,7 @@ function Harness({
         act(async () => actions.restoreToMessage(...args)) as Promise<void>,
       steerPrompt: (...args: Parameters<typeof actions.steerPrompt>) =>
         act(async () => actions.steerPrompt(...args)) as Promise<boolean>,
+      submitTextRaw: actions.submitText,
       submitText: (...args: Parameters<typeof actions.submitText>) =>
         act(async () => actions.submitText(...args)) as Promise<boolean>
     })
@@ -275,6 +278,324 @@ describe('usePromptActions /title', () => {
     )
     expect(refreshSessions).not.toHaveBeenCalled()
     expect($sessions.get()[0]?.title).toBe('Old title')
+  })
+})
+
+// Helper: extract rendered text parts from captured updateSessionState seeds.
+function renderedSeedTexts(seeds: Record<string, unknown>[]): string[] {
+  return seeds.flatMap(state => {
+    const messages = Array.isArray(state.messages)
+      ? (state.messages as Array<{ parts?: Array<{ text?: string }> }>)
+      : []
+
+    return messages.flatMap(message => (message.parts ?? []).map(part => part.text ?? ''))
+  })
+}
+
+describe('usePromptActions /compress', () => {
+  beforeEach(() => {
+    setSessions(() => [sessionInfo()])
+  })
+
+  afterEach(() => {
+    cleanup()
+    clearNotifications()
+    setCurrentUsage({ calls: 0, input: 0, output: 0, total: 0 })
+    setMessages([])
+    vi.restoreAllMocks()
+  })
+
+  it('routes through session.compress (not slash.exec) with a 120s timeout and renders the summary', async () => {
+    const seeds: Record<string, unknown>[] = []
+
+    const requestGateway = vi.fn(async (method: string, _params?: Record<string, unknown>, _timeoutMs?: number) => {
+      if (method === 'session.compress') {
+        return {
+          removed: 8,
+          summary: {
+            headline: 'Compressed: 234 → 226 messages',
+            noop: false,
+            token_line: 'Approx request size: ~285,727 → ~198,104 tokens'
+          }
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} onSeedState={s => seeds.push(s)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('/compress')
+
+    // The dedicated RPC is the TUI's path and has no slash-worker pipe
+    // timeout — and the call carries an LLM-sized client timeout instead of
+    // the 30s WS default, so a large session's compression can finish.
+    expect(requestGateway).toHaveBeenCalledWith('session.compress', expect.objectContaining({ session_id: RUNTIME_SESSION_ID }), 120_000)
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+    expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
+  })
+
+  it('replaces the transcript from the response messages', async () => {
+    const seeds: Record<string, unknown>[] = []
+
+    const requestGateway = vi.fn(async (method: string, _params?: Record<string, unknown>, _timeoutMs?: number) => {
+      if (method === 'session.compress') {
+        return {
+          removed: 2,
+          summary: { headline: 'Compressed: 4 → 2 messages' },
+          messages: [
+            { role: 'user', content: 'summarized context' },
+            { role: 'assistant', content: 'sure, here is the summary' }
+          ]
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} onSeedState={s => seeds.push(s)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('/compress')
+
+    // The transcript was replaced with the post-compress history.
+    const finalMessages = seeds[seeds.length - 1]?.messages as Array<{ parts?: Array<{ text?: string }> }>
+    const renderedText = (finalMessages ?? []).flatMap(message => (message.parts ?? []).map(part => part.text ?? '')).join('\n')
+
+    expect(renderedText).toContain('summarized context')
+    expect(renderedText).toContain('sure, here is the summary')
+  })
+
+  it('passes a focus topic through as focus_topic', async () => {
+    const requestGateway = vi.fn(async (_method: string, _params?: Record<string, unknown>, _timeoutMs?: number) => ({ removed: 0 }) as never)
+
+    let handle: HarnessHandle | null = null
+    await actRender(<Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />)
+
+    await handle!.submitText('/compress the auth refactor')
+
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.compress',
+      expect.objectContaining({ focus_topic: 'the auth refactor' }),
+      120_000
+    )
+  })
+
+  it('surfaces the RPC error verbatim (e.g. the busy guard) instead of a routing error', async () => {
+    const seeds: Record<string, unknown>[] = []
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.compress') {
+        throw new Error('session busy — /interrupt the current turn before /compress')
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} onSeedState={s => seeds.push(s)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('/compress')
+
+    const texts = renderedSeedTexts(seeds)
+    expect(texts.some(text => text.includes('session busy'))).toBe(true)
+    expect(texts.some(text => text.includes('not a quick/plugin/skill command'))).toBe(false)
+  })
+
+  it('does not clobber the foreground transcript when compression resolves after a session switch', async () => {
+    const RUNTIME_SESSION_B = 'rt-session-b'
+
+    let resolveCompress: (value: unknown) => void = () => undefined
+    const compressResult = new Promise(resolve => {
+      resolveCompress = resolve
+    })
+
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: RUNTIME_SESSION_ID }
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.compress') {
+        return (await compressResult) as never
+      }
+
+      throw new Error(`unexpected method: ${method}`)
+    })
+
+    setMessages([{ id: 'foreground-b', parts: [textPart('session B transcript')], role: 'user', timestamp: 0 }])
+    setCurrentUsage({ calls: 7, input: 70, output: 30, total: 100 })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness activeSessionIdRef={activeSessionIdRef} onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    // Start the request in a synchronous act. The async `submitText` harness
+    // helper cannot be used here: this test intentionally keeps its promise
+    // pending while the user switches sessions, which would leave React's
+    // async act scope open and overlap the wait below.
+    let submitted: Promise<boolean>
+    act(() => {
+      submitted = handle!.submitTextRaw('/compress')
+    })
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.compress', expect.anything(), 120_000))
+
+    // Switch to session B before compression resolves.
+    activeSessionIdRef.current = RUNTIME_SESSION_B
+    resolveCompress({
+      info: { usage: { context_used: 4_000, total: 12_000 } },
+      messages: [{ content: 'compressed session A transcript', role: 'system' }],
+      removed: 5
+    })
+    await act(async () => {
+      await submitted
+    })
+
+    // The foreground transcript + usage are unchanged — the late result only
+    // updated session A's cache, not the active session B's.
+    expect($messages.get()).toEqual([{ id: 'foreground-b', parts: [textPart('session B transcript')], role: 'user', timestamp: 0 }])
+    expect($currentUsage.get()).toEqual(expect.objectContaining({ calls: 7, input: 70, output: 30, total: 100 }))
+  })
+
+  it('keeps a late compression error bound to its invocation-time stored session', async () => {
+    const RUNTIME_SESSION_B = 'rt-session-b'
+    const storedSessionIdRef: MutableRefObject<string | null> = { current: 'stored-a' }
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: RUNTIME_SESSION_ID }
+    const updates: Array<{ sessionId: string; storedSessionId: null | string | undefined }> = []
+    let rejectCompress: (reason?: unknown) => void = () => undefined
+
+    const compressResult = new Promise((_, reject) => {
+      rejectCompress = reject
+    })
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.compress') {
+        return (await compressResult) as never
+      }
+
+      throw new Error(`unexpected method: ${method}`)
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionIdRef={activeSessionIdRef}
+        onReady={h => (handle = h)}
+        onUpdateState={(sessionId, storedSessionId) => updates.push({ sessionId, storedSessionId })}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={storedSessionIdRef}
+      />
+    )
+
+    // Keep the RPC pending while the selected stored session changes without
+    // leaving an async React act scope open (see the foreground-race test).
+    let submitted: Promise<boolean>
+    act(() => {
+      submitted = handle!.submitTextRaw('/compress')
+    })
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.compress', expect.anything(), 120_000))
+    activeSessionIdRef.current = RUNTIME_SESSION_B
+    storedSessionIdRef.current = 'stored-b'
+    rejectCompress(new Error('compression failed'))
+    await act(async () => {
+      await submitted
+    })
+
+    expect(updates).toContainEqual({ sessionId: RUNTIME_SESSION_ID, storedSessionId: 'stored-a' })
+  })
+  it('shows a compression progress toast outside the transcript', async () => {
+    let resolveCompress: (value: unknown) => void = () => undefined
+    const compressResult = new Promise(resolve => {
+      resolveCompress = resolve
+    })
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.compress') {
+        return (await compressResult) as never
+      }
+
+      throw new Error(`unexpected method: ${method}`)
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(<Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />)
+
+    const submitted = handle!.submitTextRaw('/compress')
+    await waitFor(() => expect($notifications.get().some(item => item.message === 'compressing context...')).toBe(true))
+    resolveCompress({ messages: [{ content: 'compressed transcript', role: 'system' }] })
+    await submitted
+  })
+})
+
+describe('usePromptActions exec fallback error reporting', () => {
+  beforeEach(() => {
+    setSessions(() => [sessionInfo()])
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('surfaces the slash.exec failure when command.dispatch only adds "not a quick/plugin/skill command"', async () => {
+    const seeds: Record<string, unknown>[] = []
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'slash.exec') {
+        throw new Error('slash worker timed out')
+      }
+
+      if (method === 'command.dispatch') {
+        throw new Error('not a quick/plugin/skill command: status')
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} onSeedState={s => seeds.push(s)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('/status')
+
+    // The dispatch fallback knowing nothing about /status is routing noise;
+    // the worker timeout is what actually went wrong (#44456).
+    const texts = renderedSeedTexts(seeds)
+    expect(texts.some(text => text.includes('slash worker timed out'))).toBe(true)
+    expect(texts.some(text => text.includes('not a quick/plugin/skill command'))).toBe(false)
+  })
+
+  it('still reports a real command.dispatch failure for skill/quick commands', async () => {
+    const seeds: Record<string, unknown>[] = []
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'slash.exec') {
+        throw new Error('skill command: use command.dispatch for /my-skill')
+      }
+
+      if (method === 'command.dispatch') {
+        throw new Error('quick command failed with exit code 1')
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} onSeedState={s => seeds.push(s)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('/my-skill')
+
+    const texts = renderedSeedTexts(seeds)
+    expect(texts.some(text => text.includes('quick command failed with exit code 1'))).toBe(true)
   })
 })
 

@@ -478,8 +478,10 @@ export function usePromptActions({
     refreshSessions,
     requestGateway,
     resumeStoredSession,
+    selectedStoredSessionIdRef,
     startFreshSessionDraft,
-    submitPromptText
+    submitPromptText,
+    updateSessionState
   })
 
   const submitText = useCallback(

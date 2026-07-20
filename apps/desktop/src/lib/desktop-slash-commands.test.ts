@@ -81,6 +81,20 @@ describe('desktop slash command curation', () => {
     expect(resolveDesktopCommand('/browser')?.args).toBe(true)
   })
 
+  it('routes /compress through the session-compression action', () => {
+    // /compress must be an action (session.compress RPC), not exec: the slash
+    // worker route times out on large sessions (#44456).
+    expect(resolveDesktopCommand('/compress')?.surface).toEqual({ kind: 'action', action: 'compress' })
+    expect(resolveDesktopCommand('/compress')?.args).toBe(true)
+    expect(isDesktopSlashCommand('/compress')).toBe(true)
+    expect(isDesktopSlashSuggestion('/compress')).toBe(true)
+    expect(desktopSlashUnavailableMessage('/compress')).toBeNull()
+    // /compact is an alias — executes but stays out of the popover.
+    expect(resolveDesktopCommand('/compact')?.surface).toEqual({ kind: 'action', action: 'compress' })
+    expect(isDesktopSlashCommand('/compact')).toBe(true)
+    expect(isDesktopSlashSuggestion('/compact')).toBe(false)
+  })
+
   it('routes /journey (and aliases) to the memory graph overlay action', () => {
     expect(resolveDesktopCommand('/journey')?.surface).toEqual({ kind: 'action', action: 'journey' })
     expect(resolveDesktopCommand('/memory-graph')?.surface).toEqual({ kind: 'action', action: 'journey' })

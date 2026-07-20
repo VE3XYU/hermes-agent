@@ -31,6 +31,7 @@ export interface DesktopThemeCommandOption {
 export type DesktopActionId =
   | 'branch'
   | 'browser'
+  | 'compress'
   | 'handoff'
   | 'hatch'
   | 'help'
@@ -148,7 +149,11 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     surface: exec()
   },
   { name: '/background', description: 'Run a prompt in the background', aliases: ['/bg', '/btw'], surface: exec() },
-  { name: '/compress', description: 'Compress this conversation context', aliases: ['/compact'], surface: exec() },
+  // /compress must be an action (session.compress RPC), not exec: the slash
+  // worker route times out on large sessions (30s WS / 45s pipe) before the
+  // LLM summarise call finishes, then command.dispatch surfaces a bogus
+  // "not a quick/plugin/skill command: compress" (#44456).
+  { name: '/compress', description: 'Compress this conversation context', aliases: ['/compact'], surface: action('compress'), args: true },
   { name: '/debug', description: 'Create a debug report', surface: exec() },
   { name: '/goal', description: 'Manage the standing goal for this session', surface: exec() },
   { name: '/personality', description: 'Switch personality for this session', surface: exec(), args: true },
