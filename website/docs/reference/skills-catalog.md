@@ -143,6 +143,7 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | Skill | Description | Path |
 |-------|-------------|------|
 | [`openhue`](/docs/user-guide/skills/bundled/smart-home/smart-home-openhue) | Control Philips Hue lights, scenes, rooms via OpenHue CLI. | `smart-home/openhue` |
+| [`sonos`](/docs/user-guide/skills/bundled/smart-home/smart-home-sonos) | Control Sonos speakers: playback, volume, grouping. | `smart-home/sonos` |
 
 ## social-media
 

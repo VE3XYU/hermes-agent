@@ -297,6 +297,7 @@ const sidebars: SidebarsConfig = {
                   collapsed: true,
                   items: [
                     'user-guide/skills/bundled/smart-home/smart-home-openhue',
+                    'user-guide/skills/bundled/smart-home/smart-home-sonos',
                   ],
                 },
                 {
