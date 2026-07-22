@@ -2317,7 +2317,11 @@ class MatrixAdapter(BasePlatformAdapter):
             and client_loop is not current_loop
         ):
             task = asyncio.ensure_future(coro, loop=client_loop)
-            bridged = asyncio.wait_for(task, timeout=timeout) if timeout is not None else task
+            # Always wrap in wait_for so the bridged object is a coroutine,
+            # not a raw Task.  run_coroutine_threadsafe requires a coroutine;
+            # passing a Task raises "A coroutine object is required".
+            _timeout = timeout if timeout is not None else 120.0
+            bridged = asyncio.wait_for(task, timeout=_timeout)
             return await asyncio.wrap_future(
                 asyncio.run_coroutine_threadsafe(bridged, client_loop)
             )
@@ -2368,7 +2372,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 mime_type=content_type,
                 filename=filename,
                 size=len(upload_data),
-            ))
+            ), timeout=120)
         except Exception as exc:
             logger.error("Matrix: upload failed: %s", exc)
             return SendResult(success=False, error=str(exc))
@@ -2400,7 +2404,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 RoomID(room_id),
                 EventType.ROOM_MESSAGE,
                 msg_content,
-            ))
+            ), timeout=45)
             return SendResult(success=True, message_id=str(event_id))
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
