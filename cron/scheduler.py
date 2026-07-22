@@ -3854,6 +3854,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        # Delivery failure also downgrades the run — the agent worked but
+        # we couldn't get the result to the user (platform down, token
+        # invalid, media upload failed, etc.).
+        if success and delivery_error:
+            success = False
+            error = error or f"Delivery failed: {delivery_error}"
+
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
         finish_execution(execution_id, success=success, error=error)
