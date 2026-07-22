@@ -1660,7 +1660,7 @@ class MatrixAdapter(BasePlatformAdapter):
             self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
 
             try:
-                event_id = await asyncio.wait_for(
+                event_id = await self._run_on_client_loop(
                     self._client.send_message_event(
                         RoomID(chat_id),
                         EventType.ROOM_MESSAGE,
@@ -1675,7 +1675,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 if self._encryption and getattr(self._client, "crypto", None):
                     try:
                         await self._client.crypto.share_keys()
-                        event_id = await asyncio.wait_for(
+                        event_id = await self._run_on_client_loop(
                             self._client.send_message_event(
                                 RoomID(chat_id),
                                 EventType.ROOM_MESSAGE,
@@ -2282,6 +2282,53 @@ class MatrixAdapter(BasePlatformAdapter):
     # File helpers
     # ------------------------------------------------------------------
 
+    async def _run_on_client_loop(self, coro, timeout: Optional[float] = None):
+        """Run an aiohttp client coroutine on the client's own event loop.
+
+        The gateway captures its event loop at startup and passes it to the cron
+        scheduler. After a reconnect/restart the Matrix aiohttp ClientSession is
+        bound to a *new* loop, but cron still dispatches via
+        ``run_coroutine_threadsafe(coro, STALE_LOOP)``. aiohttp 3.14+
+        ``TimeoutHandle.__enter__`` calls
+        ``asyncio.current_task(loop=session._loop)`` — the coroutine is a Task on
+        the stale loop, so the lookup returns None and aiohttp raises
+        ``Timeout context manager should be used inside a task``.
+
+        This helper detects the loop mismatch and bridges the coroutine onto the
+        client's live loop so the aiohttp timeout handle resolves correctly.
+        """
+        client = self._client
+        if client is None:
+            raise RuntimeError("Matrix client is not connected")
+        try:
+            client_loop = client.api.session._loop
+        except Exception:
+            client_loop = None
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        # Only re-route when the client loop is a *different, running* real loop.
+        # (A MagicMock in tests is not AbstractEventLoop → falls through to the
+        #  normal await, so existing mocks keep working.)
+        if (
+            isinstance(client_loop, asyncio.AbstractEventLoop)
+            and client_loop.is_running()
+            and client_loop is not current_loop
+        ):
+            task = asyncio.ensure_future(coro, loop=client_loop)
+            # Always wrap in wait_for so the bridged object is a coroutine,
+            # not a raw Task.  run_coroutine_threadsafe requires a coroutine;
+            # passing a Task raises "A coroutine object is required".
+            _timeout = timeout if timeout is not None else 120.0
+            bridged = asyncio.wait_for(task, timeout=_timeout)
+            return await asyncio.wrap_future(
+                asyncio.run_coroutine_threadsafe(bridged, client_loop)
+            )
+        if timeout is not None:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        return await coro
+
     async def _upload_and_send(
         self,
         room_id: str,
@@ -2320,12 +2367,12 @@ class MatrixAdapter(BasePlatformAdapter):
 
         # Upload to homeserver.
         try:
-            mxc_url = await self._client.upload_media(
+            mxc_url = await self._run_on_client_loop(self._client.upload_media(
                 upload_data,
                 mime_type=content_type,
                 filename=filename,
                 size=len(upload_data),
-            )
+            ), timeout=120)
         except Exception as exc:
             logger.error("Matrix: upload failed: %s", exc)
             return SendResult(success=False, error=str(exc))
@@ -2353,11 +2400,11 @@ class MatrixAdapter(BasePlatformAdapter):
         self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
 
         try:
-            event_id = await self._client.send_message_event(
+            event_id = await self._run_on_client_loop(self._client.send_message_event(
                 RoomID(room_id),
                 EventType.ROOM_MESSAGE,
                 msg_content,
-            )
+            ), timeout=45)
             return SendResult(success=True, message_id=str(event_id))
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
