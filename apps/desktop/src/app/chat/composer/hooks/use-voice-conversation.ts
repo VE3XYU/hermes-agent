@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
-import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
+import { monitorSpeechDuringPlayback } from '@/lib/voice-barge-in'
+import {
+  playSpeechText,
+  type SpeechStreamSession,
+  startSpeechStream,
+  stopVoicePlayback
+} from '@/lib/voice-playback'
 import { notify, notifyError } from '@/store/notifications'
 
 import { useMicRecorder } from './use-mic-recorder'
@@ -44,7 +50,8 @@ export function useVoiceConversation({
   const awaitingSpokenResponseRef = useRef(false)
   const responseIdRef = useRef<string | null>(null)
   const spokenSourceLengthRef = useRef(0)
-  const speechBufferRef = useRef('')
+  const speechSessionRef = useRef<null | SpeechStreamSession>(null)
+  const stopBargeMonitorRef = useRef<(() => void) | null>(null)
   const enabledRef = useRef(enabled)
   const mutedRef = useRef(muted)
   const busyRef = useRef(busy)
@@ -74,60 +81,12 @@ export function useVoiceConversation({
     }
   }
 
-  const resetSpeechBuffer = () => {
+  const dropSpeechSession = () => {
+    stopBargeMonitorRef.current?.()
+    stopBargeMonitorRef.current = null
+    speechSessionRef.current = null
     responseIdRef.current = null
     spokenSourceLengthRef.current = 0
-    speechBufferRef.current = ''
-  }
-
-  const appendSpeechText = (text: string) => {
-    if (!text) {
-      return
-    }
-
-    speechBufferRef.current = `${speechBufferRef.current}${text}`
-  }
-
-  const takeSpeechChunk = (force = false): string | null => {
-    const buffer = speechBufferRef.current.replace(/\s+/g, ' ').trim()
-
-    if (!buffer) {
-      speechBufferRef.current = ''
-
-      return null
-    }
-
-    const sentence = buffer.match(/^(.+?[.!?。！？])(?:\s+|$)/)
-
-    if (sentence?.[1] && (sentence[1].length >= 8 || force)) {
-      const chunk = sentence[1].trim()
-      speechBufferRef.current = buffer.slice(sentence[1].length).trim()
-
-      return chunk
-    }
-
-    if (!force && buffer.length > 220) {
-      const softBoundary = Math.max(
-        buffer.lastIndexOf(', ', 180),
-        buffer.lastIndexOf('; ', 180),
-        buffer.lastIndexOf(': ', 180)
-      )
-
-      if (softBoundary > 80) {
-        const chunk = buffer.slice(0, softBoundary + 1).trim()
-        speechBufferRef.current = buffer.slice(softBoundary + 1).trim()
-
-        return chunk
-      }
-    }
-
-    if (!force) {
-      return null
-    }
-
-    speechBufferRef.current = ''
-
-    return buffer
   }
 
   const handleTurn = useCallback(
@@ -167,7 +126,7 @@ export function useVoiceConversation({
           }
 
           awaitingSpokenResponseRef.current = true
-          resetSpeechBuffer()
+          dropSpeechSession()
           await onSubmit(transcript)
           setStatus('thinking')
         } catch (error) {
@@ -220,24 +179,163 @@ export function useVoiceConversation({
     }
   }, [handle, handleTurn, onFatalError, voiceCopy.couldNotStartSession, voiceCopy.microphoneFailed])
 
-  const speak = useCallback(
-    async (text: string) => {
-      setStatus('speaking')
+  const settleAfterSpeech = useCallback(
+    (barged: boolean) => {
+      dropSpeechSession()
 
-      try {
-        await playSpeechText(text, { source: 'voice-conversation' })
-      } catch (error) {
-        notifyError(error, voiceCopy.playbackFailed)
-      } finally {
-        if (enabledRef.current) {
-          pendingStartRef.current = true
-          setStatus('idle')
-        } else {
-          setStatus('idle')
+      if (barged || !awaitingSpokenResponseRef.current) {
+        awaitingSpokenResponseRef.current = false
+        consumePendingResponse()
+      }
+
+      if (enabledRef.current) {
+        pendingStartRef.current = true
+      }
+
+      setStatus('idle')
+    },
+    [consumePendingResponse]
+  )
+
+  /** Push any new reply text into the live session; finish when complete. */
+  const feedSpeechSession = useCallback(
+    (responseId: string) => {
+      const session = speechSessionRef.current
+
+      if (!session || responseIdRef.current !== responseId) {
+        return
+      }
+
+      const response = pendingResponse()
+
+      if (response && response.id === responseId) {
+        if (response.text.length > spokenSourceLengthRef.current) {
+          session.append(response.text.slice(spokenSourceLengthRef.current))
+          spokenSourceLengthRef.current = response.text.length
         }
+
+        if (!response.pending && !busyRef.current) {
+          session.finish()
+        }
+      } else if (!busyRef.current) {
+        // Reply consumed/vanished while we were speaking — close out the turn.
+        session.finish()
       }
     },
-    [voiceCopy.playbackFailed]
+    [pendingResponse]
+  )
+
+  /** Whole-text fallback: wait for the reply to complete, then speak it. */
+  const awaitFallbackSpeech = useCallback(
+    (responseId: string) => {
+      const poll = () => {
+        if (responseIdRef.current !== responseId) {
+          return
+        }
+
+        const response = pendingResponse()
+
+        if (!response || response.id !== responseId) {
+          settleAfterSpeech(false)
+
+          return
+        }
+
+        if (response.pending || busyRef.current) {
+          window.setTimeout(poll, 250)
+
+          return
+        }
+
+        let barged = false
+
+        stopBargeMonitorRef.current?.()
+        stopBargeMonitorRef.current = monitorSpeechDuringPlayback(() => {
+          barged = true
+          stopVoicePlayback()
+        })
+
+        void playSpeechText(response.text, { source: 'voice-conversation' })
+          .catch(error => notifyError(error, voiceCopy.playbackFailed))
+          .finally(() => {
+            if (responseIdRef.current === responseId) {
+              awaitingSpokenResponseRef.current = false
+              settleAfterSpeech(barged)
+            }
+          })
+      }
+
+      poll()
+    },
+    [pendingResponse, settleAfterSpeech, voiceCopy.playbackFailed]
+  )
+
+  /**
+   * Live-speak the streaming reply: one speech session per response, fed
+   * incremental text as the assistant generates it. Audio overlaps generation
+   * — no wait for the full reply, no per-sentence gaps.
+   */
+  const openLiveSpeech = useCallback(
+    (responseId: string) => {
+      responseIdRef.current = responseId
+      spokenSourceLengthRef.current = 0
+      setStatus('speaking')
+
+      let barged = false
+
+      // VAD barge-in: the user talking over the reply cuts playback AND drops
+      // the not-yet-spoken remainder, so the loop goes straight back to
+      // listening instead of finishing the interrupted answer.
+      stopBargeMonitorRef.current = monitorSpeechDuringPlayback(() => {
+        barged = true
+        stopVoicePlayback()
+      })
+
+      void (async () => {
+        const session = await startSpeechStream({ source: 'voice-conversation' })
+
+        // The session may resolve after the loop moved on (barge, disable).
+        if (responseIdRef.current !== responseId) {
+          if (session) {
+            stopVoicePlayback()
+          }
+
+          return
+        }
+
+        if (!session) {
+          // No streaming backend/provider: speak the whole reply once it lands.
+          speechSessionRef.current = null
+          awaitFallbackSpeech(responseId)
+
+          return
+        }
+
+        speechSessionRef.current = session
+
+        // Timer-driven feed: reply text flows into the session at delta rate
+        // regardless of React render cadence.
+        const feedTimer = window.setInterval(() => feedSpeechSession(responseId), 150)
+        feedSpeechSession(responseId)
+
+        const outcome = await session.done
+        window.clearInterval(feedTimer)
+
+        if (responseIdRef.current !== responseId) {
+          return
+        }
+
+        if (outcome === 'fallback') {
+          awaitFallbackSpeech(responseId)
+
+          return
+        }
+
+        awaitingSpokenResponseRef.current = false
+        settleAfterSpeech(barged)
+      })()
+    },
+    [awaitFallbackSpeech, feedSpeechSession, settleAfterSpeech]
   )
 
   const start = useCallback(async () => {
@@ -254,7 +352,7 @@ export function useVoiceConversation({
 
     setMuted(false)
     awaitingSpokenResponseRef.current = false
-    resetSpeechBuffer()
+    dropSpeechSession()
     consumePendingResponse()
     pendingStartRef.current = true
     await startListening()
@@ -274,7 +372,7 @@ export function useVoiceConversation({
     handle.cancel()
     turnClosingRef.current = false
     awaitingSpokenResponseRef.current = false
-    resetSpeechBuffer()
+    dropSpeechSession()
     consumePendingResponse()
     setMuted(false)
     setStatus('idle')
@@ -325,8 +423,9 @@ export function useVoiceConversation({
     return () => window.removeEventListener('keydown', onKeyDown, { capture: true })
   }, [enabled, stopTurn])
 
-  // Drive the loop: after a voice-submitted turn, speak stable chunks as the
-  // assistant stream grows. Otherwise start listening when idle between turns.
+  // Drive the loop: when a voice-submitted reply appears, open a live speech
+  // session (which feeds itself from then on). Otherwise start listening when
+  // idle between turns.
   useEffect(() => {
     if (!enabled || muted) {
       return
@@ -336,38 +435,15 @@ export function useVoiceConversation({
       const response = pendingResponse()
 
       if (response) {
-        if (response.id !== responseIdRef.current) {
-          resetSpeechBuffer()
-          responseIdRef.current = response.id
-        }
+        openLiveSpeech(response.id)
 
-        if (response.text.length > spokenSourceLengthRef.current) {
-          appendSpeechText(response.text.slice(spokenSourceLengthRef.current))
-          spokenSourceLengthRef.current = response.text.length
-        }
-
-        const chunk = takeSpeechChunk(!response.pending && !busy)
-
-        if (chunk) {
-          void speak(chunk)
-
-          return
-        }
-
-        if (!response.pending && !busy) {
-          awaitingSpokenResponseRef.current = false
-          consumePendingResponse()
-          resetSpeechBuffer()
-          pendingStartRef.current = true
-          setStatus('idle')
-
-          return
-        }
+        return
       }
 
       if (!busy && status === 'thinking') {
+        // Turn finished without any speakable reply (tool-only, error).
         awaitingSpokenResponseRef.current = false
-        resetSpeechBuffer()
+        dropSpeechSession()
         pendingStartRef.current = true
         setStatus('idle')
 
@@ -382,7 +458,7 @@ export function useVoiceConversation({
     if (pendingStartRef.current) {
       void startListening()
     }
-  }, [busy, consumePendingResponse, enabled, muted, pendingResponse, speak, startListening, status])
+  }, [busy, enabled, muted, openLiveSpeech, pendingResponse, startListening, status])
 
   useEffect(() => {
     if (enabled && !wasEnabledRef.current) {

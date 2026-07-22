@@ -4205,6 +4205,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._voice_continuous = False
         self._voice_tts_done = threading.Event()
         self._voice_tts_done.set()
+        self._voice_tts_stop = None  # active streaming pipeline's stop event
 
         # Status bar visibility (toggled via /statusbar)
         self._status_bar_visible = True
@@ -11270,6 +11271,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._voice_tts_done.set()
 
 
+    def _voice_barge_in_monitor(self, stop_event: threading.Event) -> None:
+        """VAD barge-in: cut streaming TTS the moment the user starts talking.
+
+        Runs for one turn alongside the streaming pipeline (continuous voice
+        mode only — the mic is otherwise idle during playback). On speech,
+        setting *stop_event* drains the pipeline and ``_voice_tts_done`` fires,
+        which is exactly what process_loop's auto-restart waits on — so the
+        recorder picks up the user's sentence right away.
+        """
+        try:
+            from hermes_cli.config import load_config
+            voice_cfg = load_config().get("voice") or {}
+            if not (isinstance(voice_cfg, dict) and voice_cfg.get("barge_in", True)):
+                return
+            from tools.voice_mode import listen_for_speech, stop_playback
+            heard = listen_for_speech(
+                lambda: stop_event.is_set() or self._voice_tts_done.is_set()
+            )
+            if heard and not self._voice_tts_done.is_set():
+                stop_event.set()
+                stop_playback()
+        except Exception as e:
+            logger.debug("Voice barge-in monitor failed: %s", e)
+
     def _voice_beeps_enabled(self) -> bool:
         """Return whether CLI voice mode should play record start/stop beeps."""
         try:
@@ -11363,8 +11388,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             threading.Thread(target=_bg_shutdown, daemon=True).start()
             self._voice_recorder = None
 
-        # Stop any active TTS playback
+        # Stop any active TTS playback (file player + streaming pipeline)
         try:
+            if self._voice_tts_stop is not None:
+                self._voice_tts_stop.set()
             from tools.voice_mode import stop_playback
             stop_playback()
         except Exception:
@@ -12117,9 +12144,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._reasoning_shown_this_turn = False
 
             # --- Streaming TTS setup ---
-            # When ElevenLabs is the TTS provider and sounddevice is available,
-            # we stream audio sentence-by-sentence as the agent generates tokens
-            # instead of waiting for the full response.
+            # Any working TTS provider streams sentence-by-sentence as the agent
+            # generates tokens: PCM-streaming providers (ElevenLabs, OpenAI) play
+            # chunks as they arrive, everything else synthesizes per sentence.
             use_streaming_tts = False
             _streaming_box_opened = False
             text_queue = None
@@ -12130,20 +12157,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if self._voice_tts:
                 try:
                     from tools.tts_tool import (
-                        _load_tts_config as _load_tts_cfg,
-                        _get_provider as _get_prov,
-                        _import_elevenlabs,
                         _import_sounddevice,
+                        check_tts_requirements,
                         stream_tts_to_speaker,
                     )
-                    _tts_cfg = _load_tts_cfg()
-                    if _get_prov(_tts_cfg) == "elevenlabs":
-                        # Verify both ElevenLabs SDK and audio output are available
-                        _import_elevenlabs()
-                        _import_sounddevice()
-                        use_streaming_tts = True
-                except (ImportError, OSError):
-                    pass
+                    _import_sounddevice()
+                    use_streaming_tts = check_tts_requirements()
                 except Exception:
                     pass
 
@@ -12171,6 +12190,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     daemon=True,
                 )
                 tts_thread.start()
+                # Expose the pipeline's stop event so barge-in paths (voice
+                # key, VAD monitor) can cut playback from outside this turn.
+                self._voice_tts_stop = stop_event
+                if self._voice_continuous:
+                    threading.Thread(
+                        target=self._voice_barge_in_monitor, args=(stop_event,), daemon=True
+                    ).start()
 
                 def stream_callback(delta: str):
                     if text_queue is not None:
@@ -13316,6 +13342,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._voice_continuous = False  # Whether to auto-restart after agent responds
         self._voice_tts_done = threading.Event()  # Signals TTS playback finished
         self._voice_tts_done.set()  # Initially "done" (no TTS pending)
+        self._voice_tts_stop = None  # active streaming pipeline's stop event
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
             self._install_tool_callbacks()
@@ -14104,9 +14131,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     return
 
                 # Interrupt TTS if playing, so user can start talking.
-                # stop_playback() is fast (just terminates a subprocess).
+                # stop_playback() is fast (just terminates a subprocess);
+                # the stop event drains the streaming pipeline if one is live.
                 if not cli_ref._voice_tts_done.is_set():
                     try:
+                        if cli_ref._voice_tts_stop is not None:
+                            cli_ref._voice_tts_stop.set()
                         from tools.voice_mode import stop_playback
                         stop_playback()
                         cli_ref._voice_tts_done.set()

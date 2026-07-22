@@ -1476,3 +1476,71 @@ class TestSilenceCallbackLock:
         recorder.cancel()
         with recorder._lock:
             assert recorder._on_silence_stop is None
+
+
+# ============================================================================
+# listen_for_speech — VAD barge-in monitor
+# ============================================================================
+
+class _FakeInputStream:
+    """Context-manager InputStream serving a fixed sequence of RMS levels."""
+
+    def __init__(self, np, levels):
+        self._np = np
+        self._levels = list(levels)
+        self.reads = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self, frames):
+        level = self._levels[min(self.reads, len(self._levels) - 1)]
+        self.reads += 1
+        return self._np.full((frames, 1), level, dtype=self._np.int16), False
+
+
+class TestListenForSpeech:
+    """listen_for_speech: calibration → sustained-speech trigger → barge-in."""
+
+    CALIB_BLOCKS = 14   # 400ms / 30ms
+    TRIP_BLOCKS = 10    # 300ms / 30ms
+
+    def _run(self, mock_sd, levels, should_stop=None, **kwargs):
+        np = pytest.importorskip("numpy")
+        stream = _FakeInputStream(np, levels)
+        mock_sd.InputStream.return_value = stream
+        from tools.voice_mode import listen_for_speech
+        stops = iter([False] * 200 + [True] * 10_000)
+        return listen_for_speech(should_stop or (lambda: next(stops)), **kwargs), stream
+
+    def test_sustained_speech_triggers(self, mock_sd):
+        levels = [0] * self.CALIB_BLOCKS + [5000] * 50
+        heard, _ = self._run(mock_sd, levels)
+        assert heard is True
+
+    def test_brief_spike_does_not_trigger(self, mock_sd):
+        levels = [0] * self.CALIB_BLOCKS + [5000] * (self.TRIP_BLOCKS - 2) + [0] * 500
+        heard, _ = self._run(mock_sd, levels)
+        assert heard is False
+
+    def test_should_stop_wins_over_silence(self, mock_sd):
+        """TTS finishing (should_stop) ends the monitor without a trigger —
+        the default _run stopper flips True after 200 silent reads."""
+        heard, stream = self._run(mock_sd, [0] * 500)
+        assert heard is False
+        assert stream.reads <= 201
+
+    def test_returns_false_when_audio_unavailable(self, monkeypatch):
+        monkeypatch.setattr("tools.voice_mode._import_audio", MagicMock(side_effect=OSError("no audio")))
+        from tools.voice_mode import listen_for_speech
+        assert listen_for_speech(lambda: False) is False
+
+    def test_loud_floor_raises_trigger(self, mock_sd):
+        """Speaker bleed during calibration bakes into the floor — playback-level
+        audio after calibration must NOT trip (only louder speech does)."""
+        levels = [2000] * self.CALIB_BLOCKS + [2000] * 100
+        heard, _ = self._run(mock_sd, levels)
+        assert heard is False

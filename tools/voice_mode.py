@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 import wave
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -1115,6 +1115,54 @@ def play_audio_file(file_path: str) -> bool:
                     _active_playback = None
 
     logger.warning("No audio player available for %s", file_path)
+    return False
+
+
+# ============================================================================
+# Barge-in — detect the user speaking over TTS playback
+# ============================================================================
+def listen_for_speech(
+    should_stop: Callable[[], bool],
+    threshold: Optional[int] = None,
+    sustained_ms: int = 300,
+    calibration_ms: int = 400,
+) -> bool:
+    """Block until sustained speech is heard on the mic, or *should_stop*.
+
+    Barge-in monitor: run in a side thread while TTS is playing; ``True``
+    means the user started talking and playback should be cut.
+
+    The noise floor is calibrated from the first *calibration_ms* of input —
+    playback is already audible then, so speaker bleed is baked into the
+    floor and only louder-than-playback speech trips the trigger. Requiring
+    *sustained_ms* of consecutive above-threshold blocks filters out coughs,
+    keyboard thumps, and playback transients.
+    """
+    try:
+        sd, np = _import_audio()
+    except (ImportError, OSError):
+        return False
+
+    block = int(SAMPLE_RATE * 0.03)  # 30ms blocks
+    calib_blocks = max(1, calibration_ms // 30)
+    trip_blocks = max(1, sustained_ms // 30)
+    floor_samples: List[float] = []
+    consecutive = 0
+
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16", blocksize=block) as stream:
+            while not should_stop():
+                data, _ = stream.read(block)
+                rms = float(np.sqrt(np.mean(data.astype(np.float64) ** 2)))
+                if len(floor_samples) < calib_blocks:
+                    floor_samples.append(rms)
+                    continue
+                trigger = max(float(threshold or SILENCE_RMS_THRESHOLD * 2), float(np.median(floor_samples)) * 3.5)
+                consecutive = consecutive + 1 if rms >= trigger else 0
+                if consecutive >= trip_blocks:
+                    return True
+    except Exception as e:
+        logger.debug("Barge-in listener failed: %s", e)
     return False
 
 
