@@ -11,9 +11,8 @@ name: CI rerun coordinator
 # silently failing and leaving the reviewer stuck.
 #
 # The workflow also watches completed CI runs. When ARC reports a runner
-# shutdown, it retries failed jobs once and posts a dedicated PR notice. This
-# keeps cheap spot capacity usable without silently treating real test failures
-# as runner interruptions.
+# shutdown, it retries failed jobs through five total attempts. This keeps
+# cheap spot capacity usable without retrying real test failures.
 
 on:
   pull_request:
@@ -24,7 +23,6 @@ on:
 
 permissions:
   actions: write
-  issues: write
   pull-requests: read
 
 concurrency:
@@ -90,7 +88,7 @@ jobs:
           echo "Done. GitHub will rerun review-labels and all dependent jobs."
 
   rerun-spot-interruption:
-    name: Retry ARC runner interruption once
+    name: Retry ARC runner interruption
     # Only react to failed PR CI runs. ``workflow_run`` always executes from
     # the default branch, so this coordinator never executes PR code.
     if: >-
@@ -101,7 +99,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Detect runner shutdown, notify, and retry once
+      - name: Detect runner shutdown and retry
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -112,13 +110,6 @@ jobs:
 
           # Read only GitHub's job metadata and logs. Do not checkout or run
           # any code from the PR in this privileged workflow_run context.
-          PR_NUMBER=$(gh api "repos/$REPO/actions/runs/$RUN_ID" \
-            --jq '.pull_requests[0].number // empty')
-          if [ -z "$PR_NUMBER" ]; then
-            echo "No PR is associated with CI run $RUN_ID; nothing to retry."
-            exit 0
-          fi
-
           shutdown_jobs=()
           while IFS= read -r job_id; do
             [ -z "$job_id" ] && continue
@@ -134,34 +125,15 @@ jobs:
             exit 0
           fi
 
-          run_url="${GITHUB_SERVER_URL}/${REPO}/actions/runs/${RUN_ID}"
-          marker='<!-- hermes-arc-spot-retry -->'
-          if [ "$RUN_ATTEMPT" -lt 2 ]; then
-            message="$marker
-          ARC runner interruption detected in ${#shutdown_jobs[@]} failed job(s) on [CI run $RUN_ID]($run_url). Retrying the failed jobs once on fresh spot capacity."
-            outcome='retrying failed jobs once'
-          else
-            message="$marker
-          ARC runner interruption detected again in ${#shutdown_jobs[@]} failed job(s) on [CI run $RUN_ID]($run_url). The automatic retry budget is exhausted; please rerun the failed jobs manually or inspect runner capacity."
-            outcome='automatic retry budget exhausted'
-          fi
-
-          comment_id=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
-            --jq ".[] | select(.body | contains(\"$marker\")) | .id" | head -1 || true)
-          if [ -n "$comment_id" ]; then
-            gh api --method PATCH "repos/$REPO/issues/comments/$comment_id" -f body="$message" >/dev/null
-          else
-            gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$message" >/dev/null
-          fi
-
           {
             echo '## ARC spot runner interruption'
             echo
             echo "Detected ${#shutdown_jobs[@]} failed job(s) whose runner received a shutdown signal."
-            echo "Result: $outcome."
-            echo "[View the interrupted CI run]($run_url)"
+            echo "CI attempt: $RUN_ATTEMPT of 5."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$RUN_ATTEMPT" -lt 2 ]; then
+          if [ "$RUN_ATTEMPT" -lt 5 ]; then
             gh run rerun "$RUN_ID" --repo "$REPO" --failed
+          else
+            echo "Runner interruption retry budget exhausted after five attempts."
           fi
